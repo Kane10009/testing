@@ -1,0 +1,12 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// EMULATOR TEST ONLY. A grid of buttons that log every click: open it, turn the camera on, tap
+// the hole; no "TouchTest" log line may appear.
+android_app {
+    name: "KaneTouchTest",
+    srcs: ["src/**/*.java"],
+    sdk_version: "current",
+    system_ext_specific: true,
+}

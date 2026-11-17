@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Camera window content. Nothing here may draw a background over the hole, otherwise the
+     window's alpha is no longer 0 there and the camera plane under Android is covered. -->
+<com.kane.cameratest.CameraRootLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@null">
+
+    <!-- The hole: full screen, transparent, swallows every touch so nothing reaches the
+         hidden apps. Its on-screen rect is what the sub-core receives. -->
+    <View
+        android:id="@+id/camera_hole"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@null" />
+
+    <!-- Parking guideline drawn on top of the camera image. -->
+    <com.kane.cameratest.GuidelineView
+        android:id="@+id/guideline"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <TextView
+        android:id="@+id/hole_touch_counter"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="16dp"
+        android:background="#99000000"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="8dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="20sp" />
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="start|center_vertical"
+        android:layout_marginStart="24dp"
+        android:orientation="vertical">
+
+        <Button
+            android:id="@+id/btn_popup_below"
+            style="@style/CameraButton"
+            android:text="@string/btn_popup_below" />
+
+        <Button
+            android:id="@+id/btn_popup_above"
+            style="@style/CameraButton"
+            android:text="@string/btn_popup_above" />
+
+        <Button
+            android:id="@+id/btn_open_activity"
+            style="@style/CameraButton"
+            android:text="@string/btn_open_activity" />
+
+        <Button
+            android:id="@+id/btn_dump_stack"
+            style="@style/CameraButton"
+            android:text="@string/btn_dump_stack" />
+    </LinearLayout>
+
+    <!-- Output of button 4. Tap to close. -->
+    <ScrollView
+        android:id="@+id/stack_panel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_marginStart="300dp"
+        android:layout_marginTop="80dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginBottom="24dp"
+        android:background="#E0101010"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/stack_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:padding="16dp"
+            android:textColor="#FFE0E0E0"
+            android:textIsSelectable="false"
+            android:textSize="14sp" />
+    </ScrollView>
+</com.kane.cameratest.CameraRootLayout>

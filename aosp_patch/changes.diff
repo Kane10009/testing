@@ -1,0 +1,2734 @@
+--- a/frameworks/base/libs/WindowManager/Shell/src/com/android/wm/shell/RootTaskDisplayAreaOrganizer.java
++++ b/frameworks/base/libs/WindowManager/Shell/src/com/android/wm/shell/RootTaskDisplayAreaOrganizer.java
+@@ -105,6 +105,22 @@
+         tx.setPosition(sc, x, y);
+     }
+ 
++    /**
++     * Shows or hides the whole root task display area (every task on the display) by changing
++     * the visibility of its leash. System windows outside the TDA are not affected.
++     *
++     * @return {@code false} if the root TDA of {@code displayId} has not appeared yet.
++     */
++    public boolean setDisplayAreaVisibility(@NonNull SurfaceControl.Transaction tx, int displayId,
++            boolean visible) {
++        final SurfaceControl sc = mLeashes.get(displayId);
++        if (sc == null) {
++            return false;
++        }
++        tx.setVisibility(sc, visible);
++        return true;
++    }
++
+     @Override
+     public void onDisplayAreaAppeared(@NonNull DisplayAreaInfo displayAreaInfo,
+             @NonNull SurfaceControl leash) {
+--- a/packages/apps/Car/SystemUI/Android.bp
++++ b/packages/apps/Car/SystemUI/Android.bp
+@@ -59,6 +59,7 @@
+         "dagger2",
+         "//external/kotlinc:kotlin-annotations",
+         "animationlib",
++        "car-camera-app-area-aidl",
+     ],
+ 
+     libs: [
+--- a/packages/apps/Car/SystemUI/AndroidManifest.xml
++++ b/packages/apps/Car/SystemUI/AndroidManifest.xml
+@@ -54,6 +54,10 @@
+     <!-- use for ActivityBlockingActivity to tell whether it's on driver or passenger display -->
+     <uses-permission android:name="android.car.permission.ACCESS_PRIVATE_DISPLAY_ID"/>
+ 
++    <!-- Lets the camera app hide/show all activities under its hole-punch window. -->
++    <permission android:name="com.android.systemui.car.permission.CONTROL_CAMERA_APP_AREA"
++        android:protectionLevel="signature" />
++
+     <application
+         tools:replace="android:name,android:appComponentFactory"
+         android:name=".CarSystemUIApplication"
+@@ -94,5 +98,10 @@
+             </intent-filter>
+             <meta-data android:name="distractionOptimized" android:value="true"/>
+         </activity>
++        <service
++            android:name=".car.cameraarea.CameraAppAreaService"
++            android:exported="true"
++            android:singleUser="true"
++            android:permission="com.android.systemui.car.permission.CONTROL_CAMERA_APP_AREA" />
+     </application>
+ </manifest>
+--- /dev/null
++++ b/packages/apps/Car/SystemUI/libs/camera-app-area/Android.bp
+@@ -0,0 +1,30 @@
++//
++// Copyright (C) 2026 The Android Open Source Project
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++// Interface between CarSystemUI (which owns the root TaskDisplayArea leash) and the camera app.
++// Shared by both sides so the AIDL and the constants never drift apart.
++java_library {
++    name: "car-camera-app-area-aidl",
++    srcs: [
++        "src/**/*.java",
++        "src/**/*.aidl",
++    ],
++    sdk_version: "current",
++}
+--- /dev/null
++++ b/packages/apps/Car/SystemUI/libs/camera-app-area/src/com/android/systemui/car/cameraarea/CameraAppAreaContract.java
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.systemui.car.cameraarea;
++
++import android.content.ComponentName;
++
++/** Constants shared by CarSystemUI and the camera app for {@link ICameraAppArea}. */
++public final class CameraAppAreaContract {
++
++    /** Signature permission required to bind {@link #SERVICE_COMPONENT}. */
++    public static final String PERMISSION =
++            "com.android.systemui.car.permission.CONTROL_CAMERA_APP_AREA";
++
++    /** The CarSystemUI service implementing {@link ICameraAppArea}. */
++    public static final ComponentName SERVICE_COMPONENT = new ComponentName(
++            "com.android.systemui",
++            "com.android.systemui.car.cameraarea.CameraAppAreaService");
++
++    /** Bundle key of the SurfaceControl.Transaction returned when deferApply is true. */
++    public static final String KEY_TRANSACTION = "transaction";
++
++    /**
++     * Emulator test mode switch, read on every camera on/off. When "1": the camera app uses the
++     * fake sub-core client and the wallpaper is left visible (it stands in for the camera plane).
++     */
++    public static final String PROP_EMULATOR_TEST = "persist.debug.camera.emulator_test";
++
++    private CameraAppAreaContract() {}
++}
+--- /dev/null
++++ b/packages/apps/Car/SystemUI/libs/camera-app-area/src/com/android/systemui/car/cameraarea/ICameraAppArea.aidl
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.systemui.car.cameraarea;
++
++import android.os.Bundle;
++
++/**
++ * Lets the camera app hide/show every activity (launcher + apps) of a display while its
++ * hole-punch camera window is shown. Implemented by CarSystemUI, which owns the leash of the
++ * default TaskDisplayArea through WMShell's RootTaskDisplayAreaOrganizer.
++ *
++ * Both calls return a Bundle. When {@code deferApply} is true and the leash is ready, the Bundle
++ * holds a SurfaceControl.Transaction under {@link CameraAppAreaContract#KEY_TRANSACTION} that the
++ * caller must apply itself (e.g. with AttachedSurfaceControl#applyTransactionOnDraw) so the change
++ * lands in the same frame as its own window. Otherwise SystemUI applies the change immediately,
++ * or as soon as the leash appears.
++ */
++interface ICameraAppArea {
++    /**
++     * Hides all apps on {@code displayId}. {@code clientToken} is watched with linkToDeath: if the
++     * caller dies, SystemUI shows the apps again so they never stay hidden.
++     */
++    Bundle hideApps(int displayId, IBinder clientToken, boolean deferApply);
++
++    /** Shows all apps on {@code displayId} again. */
++    Bundle showApps(int displayId, boolean deferApply);
++
++    /** Whether SystemUI currently wants the apps on {@code displayId} hidden. */
++    boolean isAppsHidden(int displayId);
++}
+--- a/packages/apps/Car/SystemUI/src/com/android/systemui/CarSysUIComponent.java
++++ b/packages/apps/Car/SystemUI/src/com/android/systemui/CarSysUIComponent.java
+@@ -16,6 +16,7 @@
+ 
+ package com.android.systemui;
+ 
++import com.android.systemui.car.cameraarea.CameraAppAreaModule;
+ import com.android.systemui.dagger.DependencyProvider;
+ import com.android.systemui.dagger.SysUIComponent;
+ import com.android.systemui.dagger.SysUISingleton;
+@@ -38,7 +39,8 @@
+         SystemUIModule.class,
+         CarSystemUICoreStartableModule.class,
+         CarSystemUIModule.class,
+-        CarSystemUIBinder.class})
++        CarSystemUIBinder.class,
++        CameraAppAreaModule.class})
+ public interface CarSysUIComponent extends SysUIComponent {
+ 
+     /**
+--- /dev/null
++++ b/packages/apps/Car/SystemUI/src/com/android/systemui/car/cameraarea/CameraAppAreaController.java
+@@ -0,0 +1,279 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.systemui.car.cameraarea;
++
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.content.Context;
++import android.os.IBinder;
++import android.os.RemoteException;
++import android.os.SystemClock;
++import android.os.SystemProperties;
++import android.util.Slog;
++import android.util.SparseArray;
++import android.view.Display;
++import android.view.SurfaceControl;
++import android.window.DisplayAreaInfo;
++
++import com.android.systemui.CoreStartable;
++import com.android.systemui.dagger.SysUISingleton;
++import com.android.wm.shell.RootTaskDisplayAreaOrganizer;
++
++import java.io.PrintWriter;
++import java.util.Optional;
++import java.util.concurrent.Callable;
++import java.util.concurrent.FutureTask;
++import java.util.concurrent.TimeUnit;
++
++import javax.inject.Inject;
++
++/**
++ * Hides/shows the whole default TaskDisplayArea (launcher + every app) while the camera app shows
++ * its hole-punch window, so the transparent hole reveals the camera hardware plane instead of the
++ * apps behind it.
++ *
++ * <p>Re-uses the leash owned by WMShell's {@link RootTaskDisplayAreaOrganizer}; only one organizer
++ * may exist per display-area feature, so registering another one would break the Shell.
++ *
++ * <p>All state is touched on the organizer's executor (the Shell main thread; on car
++ * {@code config_enableShellMainThread} is true, so that is not the SysUI main thread).
++ */
++@SysUISingleton
++public class CameraAppAreaController implements CoreStartable {
++    private static final String TAG = "CameraAppArea";
++    private static final long BINDER_CALL_TIMEOUT_MS = 2000;
++
++    private final Context mContext;
++    @Nullable
++    private final RootTaskDisplayAreaOrganizer mRootTDAOrganizer;
++    private final SparseArray<DisplayState> mDisplays = new SparseArray<>();
++
++    @Inject
++    public CameraAppAreaController(Context context,
++            Optional<RootTaskDisplayAreaOrganizer> rootTDAOrganizer) {
++        mContext = context;
++        mRootTDAOrganizer = rootTDAOrganizer.orElse(null);
++    }
++
++    @Override
++    public void start() {
++        if (mRootTDAOrganizer == null) {
++            Slog.w(TAG, "Disabled: no RootTaskDisplayAreaOrganizer (not the system user)");
++            return;
++        }
++        // Only the main display for now; other displays are tracked on first request.
++        runOnShellThread(() -> getOrCreateState(Display.DEFAULT_DISPLAY));
++    }
++
++    boolean isAvailable() {
++        return mRootTDAOrganizer != null;
++    }
++
++    /**
++     * Hides the apps on {@code displayId}. Returns the transaction to apply when
++     * {@code deferApply} is true and the leash is ready; otherwise applies it and returns null.
++     */
++    @Nullable
++    SurfaceControl.Transaction hideApps(int displayId, @Nullable IBinder clientToken,
++            boolean deferApply) {
++        return callOnShellThread(() -> {
++            final DisplayState state = getOrCreateState(displayId);
++            state.setClient(clientToken);
++            return setAppsHidden(state, true, deferApply, "hideApps");
++        });
++    }
++
++    /** Shows the apps on {@code displayId} again. See {@link #hideApps}. */
++    @Nullable
++    SurfaceControl.Transaction showApps(int displayId, boolean deferApply) {
++        return callOnShellThread(() -> {
++            final DisplayState state = getOrCreateState(displayId);
++            state.setClient(null);
++            return setAppsHidden(state, false, deferApply, "showApps");
++        });
++    }
++
++    boolean isAppsHidden(int displayId) {
++        final Boolean hidden = callOnShellThread(() -> {
++            final DisplayState state = mDisplays.get(displayId);
++            return state != null && state.mAppsHidden;
++        });
++        return hidden != null && hidden;
++    }
++
++    /** Must run on the shell thread. */
++    @Nullable
++    private SurfaceControl.Transaction setAppsHidden(DisplayState state, boolean hidden,
++            boolean deferApply, String reason) {
++        state.mAppsHidden = hidden;
++        state.mLastChangeUptimeMs = SystemClock.uptimeMillis();
++        state.mLastChangeReason = reason;
++        if (hidden) {
++            checkWallpaper();
++        }
++        final SurfaceControl.Transaction t = new SurfaceControl.Transaction();
++        if (!mRootTDAOrganizer.setDisplayAreaVisibility(t, state.mDisplayId, !hidden)) {
++            // Leash not ready yet: the desired state is applied in onDisplayAreaAppeared().
++            Slog.i(TAG, reason + " display=" + state.mDisplayId + ": leash not ready, deferred");
++            t.close();
++            return null;
++        }
++        Slog.i(TAG, reason + " display=" + state.mDisplayId + " deferApply=" + deferApply);
++        if (deferApply) {
++            return t;
++        }
++        t.apply();
++        t.close();
++        return null;
++    }
++
++    /**
++     * The wallpaper is not inside the TDA, so hiding the TDA does not hide it. Car builds turn the
++     * wallpaper service off; warn if a build turned it back on outside emulator test mode, where
++     * the wallpaper deliberately stands in for the camera plane.
++     */
++    private void checkWallpaper() {
++        if (SystemProperties.getBoolean(CameraAppAreaContract.PROP_EMULATOR_TEST, false)) {
++            return;
++        }
++        if (mContext.getResources().getBoolean(
++                com.android.internal.R.bool.config_enableWallpaperService)) {
++            Slog.w(TAG, "Wallpaper service is enabled: the wallpaper may show through the camera"
++                    + " hole if a visible window requests it");
++        }
++    }
++
++    @NonNull
++    private DisplayState getOrCreateState(int displayId) {
++        DisplayState state = mDisplays.get(displayId);
++        if (state == null) {
++            state = new DisplayState(displayId);
++            mDisplays.put(displayId, state);
++            // Calls onDisplayAreaAppeared() right away if the TDA already exists.
++            mRootTDAOrganizer.registerListener(displayId, state);
++        }
++        return state;
++    }
++
++    private void runOnShellThread(Runnable r) {
++        mRootTDAOrganizer.getExecutor().execute(r);
++    }
++
++    /** Runs {@code c} on the shell thread and waits for it; for binder calls. */
++    @Nullable
++    private <T> T callOnShellThread(Callable<T> c) {
++        if (mRootTDAOrganizer == null) {
++            return null;
++        }
++        final FutureTask<T> task = new FutureTask<>(c);
++        runOnShellThread(task);
++        try {
++            return task.get(BINDER_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
++        } catch (Exception e) {
++            Slog.e(TAG, "Shell thread call failed", e);
++            return null;
++        }
++    }
++
++    @Override
++    public void dump(@NonNull PrintWriter pw, @NonNull String[] args) {
++        pw.println("CameraAppAreaController:");
++        pw.println("  available=" + isAvailable()
++                + " emulatorTest=" + SystemProperties.get(CameraAppAreaContract.PROP_EMULATOR_TEST));
++        if (!isAvailable()) {
++            return;
++        }
++        final String states = callOnShellThread(() -> {
++            final StringBuilder sb = new StringBuilder();
++            for (int i = 0; i < mDisplays.size(); i++) {
++                sb.append("  ").append(mDisplays.valueAt(i)).append('\n');
++            }
++            return sb.toString();
++        });
++        pw.print(states);
++    }
++
++    /** Per-display state; also the TDA listener of that display. Shell thread only. */
++    private class DisplayState implements RootTaskDisplayAreaOrganizer.RootTaskDisplayAreaListener,
++            IBinder.DeathRecipient {
++        final int mDisplayId;
++        boolean mAppsHidden;
++        boolean mLeashReady;
++        @Nullable
++        IBinder mClient;
++        long mLastChangeUptimeMs;
++        String mLastChangeReason = "none";
++
++        DisplayState(int displayId) {
++            mDisplayId = displayId;
++        }
++
++        void setClient(@Nullable IBinder client) {
++            if (mClient == client) {
++                return;
++            }
++            if (mClient != null) {
++                mClient.unlinkToDeath(this, 0);
++            }
++            mClient = null;
++            if (client != null) {
++                try {
++                    client.linkToDeath(this, 0);
++                    mClient = client;
++                } catch (RemoteException e) {
++                    // Already dead and no death notification will come: undo the hide that
++                    // follows this call (binderDied() posts, so it runs after it).
++                    Slog.w(TAG, "Client already dead, apps will be shown again");
++                    binderDied();
++                }
++            }
++        }
++
++        @Override
++        public void binderDied() {
++            runOnShellThread(() -> {
++                if (mClient != null && mClient.isBinderAlive()) {
++                    return; // A new client took over before this notification ran.
++                }
++                Slog.w(TAG, "Camera client died, showing apps on display " + mDisplayId);
++                mClient = null;
++                setAppsHidden(this, false, false, "clientDied");
++            });
++        }
++
++        @Override
++        public void onDisplayAreaAppeared(DisplayAreaInfo displayAreaInfo) {
++            mLeashReady = true;
++            // A fresh leash is visible; re-apply a pending or previous hide request.
++            if (mAppsHidden) {
++                setAppsHidden(this, true, false, "leashAppeared");
++            }
++        }
++
++        @Override
++        public void onDisplayAreaVanished(DisplayAreaInfo displayAreaInfo) {
++            mLeashReady = false;
++        }
++
++        @Override
++        public String toString() {
++            return "display=" + mDisplayId + " appsHidden=" + mAppsHidden
++                    + " leashReady=" + mLeashReady + " client=" + mClient
++                    + " last=" + mLastChangeReason + "@" + mLastChangeUptimeMs;
++        }
++    }
++}
+--- /dev/null
++++ b/packages/apps/Car/SystemUI/src/com/android/systemui/car/cameraarea/CameraAppAreaModule.java
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.systemui.car.cameraarea;
++
++import android.app.Service;
++
++import com.android.systemui.CoreStartable;
++
++import dagger.Binds;
++import dagger.Module;
++import dagger.multibindings.ClassKey;
++import dagger.multibindings.IntoMap;
++
++/** Dagger bindings for hiding the app area under the camera hole-punch window. */
++@Module
++public abstract class CameraAppAreaModule {
++
++    /** Starts {@link CameraAppAreaController} with the other SysUI CoreStartables. */
++    @Binds
++    @IntoMap
++    @ClassKey(CameraAppAreaController.class)
++    public abstract CoreStartable bindCameraAppAreaController(CameraAppAreaController controller);
++
++    /** Lets SystemUIAppComponentFactory inject {@link CameraAppAreaService}. */
++    @Binds
++    @IntoMap
++    @ClassKey(CameraAppAreaService.class)
++    public abstract Service bindCameraAppAreaService(CameraAppAreaService service);
++}
+--- /dev/null
++++ b/packages/apps/Car/SystemUI/src/com/android/systemui/car/cameraarea/CameraAppAreaService.java
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.systemui.car.cameraarea;
++
++import android.annotation.Nullable;
++import android.app.Service;
++import android.content.Intent;
++import android.os.Bundle;
++import android.os.IBinder;
++import android.view.SurfaceControl;
++
++import javax.inject.Inject;
++
++/**
++ * Binder entry point of {@link CameraAppAreaController} for the camera app. Protected by
++ * {@link CameraAppAreaContract#PERMISSION} (signature) in the manifest and on every call.
++ */
++public class CameraAppAreaService extends Service {
++
++    private final CameraAppAreaController mController;
++
++    private final ICameraAppArea.Stub mBinder = new ICameraAppArea.Stub() {
++        @Override
++        public Bundle hideApps(int displayId, IBinder clientToken, boolean deferApply) {
++            enforcePermission();
++            return toBundle(mController.hideApps(displayId, clientToken, deferApply));
++        }
++
++        @Override
++        public Bundle showApps(int displayId, boolean deferApply) {
++            enforcePermission();
++            return toBundle(mController.showApps(displayId, deferApply));
++        }
++
++        @Override
++        public boolean isAppsHidden(int displayId) {
++            enforcePermission();
++            return mController.isAppsHidden(displayId);
++        }
++    };
++
++    @Inject
++    public CameraAppAreaService(CameraAppAreaController controller) {
++        mController = controller;
++    }
++
++    @Nullable
++    @Override
++    public IBinder onBind(Intent intent) {
++        return mController.isAvailable() ? mBinder : null;
++    }
++
++    private void enforcePermission() {
++        enforceCallingPermission(CameraAppAreaContract.PERMISSION, "ICameraAppArea");
++    }
++
++    private static Bundle toBundle(@Nullable SurfaceControl.Transaction t) {
++        final Bundle b = new Bundle();
++        if (t != null) {
++            b.putParcelable(CameraAppAreaContract.KEY_TRANSACTION, t);
++        }
++        return b;
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/Android.bp
+@@ -0,0 +1,17 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++// Test camera app for the hole-punch camera window (emulator / bring-up).
++// Uses hidden APIs (window types, task listing), so it is platform signed.
++android_app {
++    name: "KaneCameraTest",
++    srcs: ["src/**/*.java"],
++    resource_dirs: ["res"],
++    platform_apis: true,
++    certificate: "platform",
++    privileged: true,
++    system_ext_specific: true,
++    static_libs: ["car-camera-app-area-aidl"],
++    required: ["privapp-permissions-kane-cameratest.xml"],
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/AndroidManifest.xml
+@@ -0,0 +1,47 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.kane.cameratest">
++
++    <!-- Bind CarSystemUI's CameraAppAreaService (signature permission defined by CarSystemUI). -->
++    <uses-permission android:name="com.android.systemui.car.permission.CONTROL_CAMERA_APP_AREA" />
++    <!-- TYPE_SYSTEM_ALERT camera window, TYPE_SYSTEM_ERROR popup, SYSTEM_FLAG_SHOW_FOR_ALL_USERS. -->
++    <uses-permission android:name="android.permission.INTERNAL_SYSTEM_WINDOW" />
++    <!-- TYPE_APPLICATION_OVERLAY popup ("popup below"). -->
++    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
++    <!-- Button 4: list root tasks and dump activities. -->
++    <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS" />
++    <uses-permission android:name="android.permission.DUMP" />
++    <!-- Button 3: start the test activity for the current (non-system) user. -->
++    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS" />
++    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL" />
++    <uses-permission android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
++
++    <!-- persistent: the camera window lives in this process, so it must never be cached,
++         frozen (cached apps freezer -> no input -> ANR -> kill) or killed under memory
++         pressure. Only honored for system apps; runs as the system user only. -->
++    <application
++        android:label="@string/app_name"
++        android:icon="@android:drawable/ic_menu_camera"
++        android:persistent="true">
++
++        <!-- adb trigger. Restricted to callers holding DUMP (adb shell has it). Only the
++             system-user instance handles it, the same user CarSystemUI runs as. -->
++        <receiver
++            android:name=".CameraTriggerReceiver"
++            android:exported="true"
++            android:singleUser="true"
++            android:permission="android.permission.DUMP">
++            <intent-filter>
++                <action android:name="com.kane.cameratest.action.SHOW" />
++                <action android:name="com.kane.cameratest.action.HIDE" />
++                <action android:name="com.kane.cameratest.action.TOGGLE" />
++            </intent-filter>
++        </receiver>
++
++        <activity
++            android:name=".TransparencyTestActivity"
++            android:exported="false"
++            android:excludeFromRecents="true"
++            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
++    </application>
++</manifest>
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/res/layout/activity_transparency_test.xml
+@@ -0,0 +1,35 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:background="#FFD81B60"
++    android:gravity="center"
++    android:orientation="vertical"
++    android:padding="48dp">
++
++    <TextView
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:text="@string/transparency_title"
++        android:textColor="#FFFFFFFF"
++        android:textSize="44sp"
++        android:textStyle="bold" />
++
++    <TextView
++        android:id="@+id/transparency_info"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="24dp"
++        android:gravity="center"
++        android:text="@string/transparency_body"
++        android:textColor="#FFFFFFFF"
++        android:textSize="26sp" />
++
++    <Button
++        android:id="@+id/transparency_close"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="32dp"
++        android:text="@string/transparency_close"
++        android:textSize="24sp" />
++</LinearLayout>
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/res/layout/camera_window.xml
+@@ -0,0 +1,86 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Camera window content. Nothing here may draw a background over the hole, otherwise the
++     window's alpha is no longer 0 there and the camera plane under Android is covered. -->
++<com.kane.cameratest.CameraRootLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:background="@null">
++
++    <!-- The hole: full screen, transparent, swallows every touch so nothing reaches the
++         hidden apps. Its on-screen rect is what the sub-core receives. -->
++    <View
++        android:id="@+id/camera_hole"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:background="@null" />
++
++    <!-- Parking guideline drawn on top of the camera image. -->
++    <com.kane.cameratest.GuidelineView
++        android:id="@+id/guideline"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent" />
++
++    <TextView
++        android:id="@+id/hole_touch_counter"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="top|center_horizontal"
++        android:layout_marginTop="16dp"
++        android:background="#99000000"
++        android:paddingHorizontal="16dp"
++        android:paddingVertical="8dp"
++        android:textColor="#FFFFFFFF"
++        android:textSize="20sp" />
++
++    <LinearLayout
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="start|center_vertical"
++        android:layout_marginStart="24dp"
++        android:orientation="vertical">
++
++        <Button
++            android:id="@+id/btn_popup_below"
++            style="@style/CameraButton"
++            android:text="@string/btn_popup_below" />
++
++        <Button
++            android:id="@+id/btn_popup_above"
++            style="@style/CameraButton"
++            android:text="@string/btn_popup_above" />
++
++        <Button
++            android:id="@+id/btn_open_activity"
++            style="@style/CameraButton"
++            android:text="@string/btn_open_activity" />
++
++        <Button
++            android:id="@+id/btn_dump_stack"
++            style="@style/CameraButton"
++            android:text="@string/btn_dump_stack" />
++    </LinearLayout>
++
++    <!-- Output of button 4. Tap to close. -->
++    <ScrollView
++        android:id="@+id/stack_panel"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:layout_marginStart="300dp"
++        android:layout_marginTop="80dp"
++        android:layout_marginEnd="24dp"
++        android:layout_marginBottom="24dp"
++        android:background="#E0101010"
++        android:visibility="gone">
++
++        <TextView
++            android:id="@+id/stack_text"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:fontFamily="monospace"
++            android:padding="16dp"
++            android:textColor="#FFE0E0E0"
++            android:textIsSelectable="false"
++            android:textSize="14sp" />
++    </ScrollView>
++</com.kane.cameratest.CameraRootLayout>
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/res/values/strings.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="app_name">Camera Test</string>
++
++    <string name="btn_popup_below">Popup DƯỚI\n(layer 11)</string>
++    <string name="btn_popup_above">Popup TRÊN\n(layer 27)</string>
++    <string name="btn_open_activity">Mở Activity\ntest</string>
++    <string name="btn_dump_stack">Activity\ntrong stack</string>
++
++    <string name="hole_touch_counter">Vùng camera đã nuốt %1$d lần chạm</string>
++
++    <string name="popup_below_text">POPUP DƯỚI\nTYPE_APPLICATION_OVERLAY (layer 11)\nnằm DƯỚI window camera, NGOÀI TDA.\nThấy popup này qua lỗ = window ngoài TDA bị lộ.</string>
++    <string name="popup_above_text">POPUP TRÊN\nTYPE_SYSTEM_ERROR (layer 27)\nnằm TRÊN window camera.\nChạm để đóng.</string>
++
++    <string name="transparency_title">TransparencyTestActivity</string>
++    <string name="transparency_body">Activity này nằm trong DefaultTaskDisplayArea.\n\nKhi camera BẬT: bạn KHÔNG được thấy màn hình này (TDA đang bị ẩn).\nKhi camera TẮT: màn hình này phải hiện ra.</string>
++    <string name="transparency_close">Đóng</string>
++</resources>
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/res/values/styles.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <style name="CameraWindowTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
++        <item name="android:windowBackground">@null</item>
++    </style>
++
++    <style name="CameraButton">
++        <item name="android:layout_width">240dp</item>
++        <item name="android:layout_height">96dp</item>
++        <item name="android:layout_marginVertical">10dp</item>
++        <item name="android:textSize">20sp</item>
++        <item name="android:textColor">#FFFFFFFF</item>
++        <item name="android:backgroundTint">#CC1E5AA8</item>
++        <item name="android:textAllCaps">false</item>
++    </style>
++</resources>
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/AppAreaClient.java
+@@ -0,0 +1,132 @@
++package com.kane.cameratest;
++
++import android.annotation.Nullable;
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.content.ServiceConnection;
++import android.os.Binder;
++import android.os.Bundle;
++import android.os.IBinder;
++import android.os.RemoteException;
++import android.os.UserHandle;
++import android.util.Log;
++import android.view.SurfaceControl;
++
++import com.android.systemui.car.cameraarea.CameraAppAreaContract;
++import com.android.systemui.car.cameraarea.ICameraAppArea;
++
++/**
++ * Connection to CarSystemUI's CameraAppAreaService, which hides/shows the TaskDisplayArea.
++ * Stays bound once bound: when SystemUI restarts, the framework reconnects automatically and
++ * {@link Callback#onAppAreaServiceConnected} fires again with {@code reconnected = true}.
++ * Main thread only.
++ */
++final class AppAreaClient implements ServiceConnection {
++    private static final String TAG = "AppAreaClient";
++
++    interface Callback {
++        void onAppAreaServiceConnected(boolean reconnected);
++    }
++
++    private final Context mContext;
++    private final Callback mCallback;
++    /** Identifies this process to SystemUI, which shows the apps again if it dies. */
++    private final IBinder mClientToken = new Binder();
++
++    @Nullable
++    private ICameraAppArea mService;
++    private boolean mBound;
++    private boolean mEverConnected;
++
++    AppAreaClient(Context context, Callback callback) {
++        mContext = context;
++        mCallback = callback;
++    }
++
++    void bind() {
++        if (mBound) {
++            return;
++        }
++        final Intent intent = new Intent().setComponent(CameraAppAreaContract.SERVICE_COMPONENT);
++        mBound = mContext.bindServiceAsUser(intent, this,
++                Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT, UserHandle.SYSTEM);
++        if (!mBound) {
++            Log.e(TAG, "Cannot bind " + CameraAppAreaContract.SERVICE_COMPONENT
++                    + " (CarSystemUI without the camera app area patch?)");
++        }
++    }
++
++    boolean isConnected() {
++        return mService != null;
++    }
++
++    /**
++     * Hides the apps. With {@code deferApply}, returns the transaction the caller must apply
++     * together with its first window frame; null if SystemUI applied it (or will once ready).
++     */
++    @Nullable
++    SurfaceControl.Transaction hideApps(int displayId, boolean deferApply) {
++        if (mService == null) {
++            Log.w(TAG, "hideApps: SystemUI not connected, apps stay visible");
++            return null;
++        }
++        try {
++            return getTransaction(mService.hideApps(displayId, mClientToken, deferApply));
++        } catch (RemoteException e) {
++            Log.e(TAG, "hideApps failed", e);
++            return null;
++        }
++    }
++
++    /** Shows the apps again. See {@link #hideApps}. */
++    @Nullable
++    SurfaceControl.Transaction showApps(int displayId, boolean deferApply) {
++        if (mService == null) {
++            // A dead SystemUI shows the apps anyway: WM gives the TDA a fresh, visible surface.
++            Log.w(TAG, "showApps: SystemUI not connected");
++            return null;
++        }
++        try {
++            return getTransaction(mService.showApps(displayId, deferApply));
++        } catch (RemoteException e) {
++            Log.e(TAG, "showApps failed", e);
++            return null;
++        }
++    }
++
++    @Nullable
++    private static SurfaceControl.Transaction getTransaction(@Nullable Bundle b) {
++        return b == null ? null : b.getParcelable(CameraAppAreaContract.KEY_TRANSACTION,
++                SurfaceControl.Transaction.class);
++    }
++
++    @Override
++    public void onServiceConnected(ComponentName name, IBinder service) {
++        mService = ICameraAppArea.Stub.asInterface(service);
++        Log.i(TAG, "Connected to SystemUI (reconnected=" + mEverConnected + ")");
++        final boolean reconnected = mEverConnected;
++        mEverConnected = true;
++        mCallback.onAppAreaServiceConnected(reconnected);
++    }
++
++    @Override
++    public void onServiceDisconnected(ComponentName name) {
++        Log.w(TAG, "SystemUI disconnected; waiting for it to restart");
++        mService = null;
++    }
++
++    @Override
++    public void onBindingDied(ComponentName name) {
++        Log.w(TAG, "Binding died, rebinding");
++        mService = null;
++        mContext.unbindService(this);
++        mBound = false;
++        bind();
++    }
++
++    @Override
++    public void onNullBinding(ComponentName name) {
++        Log.e(TAG, "SystemUI returned no binder (no RootTaskDisplayAreaOrganizer in that user)");
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/CameraRootLayout.java
+@@ -0,0 +1,29 @@
++package com.kane.cameratest;
++
++import android.content.Context;
++import android.util.AttributeSet;
++import android.util.Log;
++import android.view.KeyEvent;
++import android.widget.FrameLayout;
++
++/**
++ * Root of the camera window. The window is focused (needed to hide the system bars), so it also
++ * receives keys: swallow BACK so it never reaches the hidden app below.
++ */
++public class CameraRootLayout extends FrameLayout {
++
++    public CameraRootLayout(Context context, AttributeSet attrs) {
++        super(context, attrs);
++    }
++
++    @Override
++    public boolean dispatchKeyEvent(KeyEvent event) {
++        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
++            if (event.getAction() == KeyEvent.ACTION_UP) {
++                Log.i(SeqLog.TAG, "BACK swallowed by camera window");
++            }
++            return true;
++        }
++        return super.dispatchKeyEvent(event);
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/CameraSession.java
+@@ -0,0 +1,215 @@
++package com.kane.cameratest;
++
++import android.annotation.Nullable;
++import android.content.Context;
++import android.content.Intent;
++import android.graphics.Rect;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.UserHandle;
++import android.util.Log;
++import android.view.Display;
++import android.view.SurfaceControl;
++
++import com.kane.cameratest.subcore.SubCoreCameraClient;
++
++import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++
++/**
++ * Camera on/off state machine. Main thread only.
++ *
++ * <pre>
++ * ON : 1. hideApps (SystemUI)  2. add camera window  3. showCamera(rect) (sub-core)
++ *      Steps 1 and 2 land in the same frame: the hide transaction is applied with the window's
++ *      first frame. Step 3 runs once that frame is committed.
++ * OFF: 1. hideCamera (sub-core)  2. camera UI gone + showApps in the same frame
++ *      3. window removed after that frame is committed
++ * </pre>
++ */
++final class CameraSession implements AppAreaClient.Callback, CameraWindow.Callbacks {
++    private static final String TAG = "CameraSession";
++    private static final int DISPLAY_ID = Display.DEFAULT_DISPLAY;
++    /** Show the camera even if SystemUI is not reachable: the camera has priority. */
++    private static final long SERVICE_WAIT_TIMEOUT_MS = 1000;
++
++    private enum State { OFF, WAITING_FOR_SYSTEMUI, ON, TURNING_OFF }
++
++    @Nullable
++    private static CameraSession sInstance;
++
++    private final Context mContext;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final Executor mBackground = Executors.newSingleThreadExecutor();
++    private final AppAreaClient mAppArea;
++    private final TestPopups mPopups;
++
++    private State mState = State.OFF;
++    private boolean mEmulatorTest;
++    @Nullable
++    private SubCoreCameraClient mSubCore;
++    @Nullable
++    private CameraWindow mWindow;
++    private boolean mCameraShown;
++    /** SHOW arrived while the previous session was still turning off. */
++    private boolean mPendingShow;
++    private int mSessionCount;
++
++    private final Runnable mServiceTimeout = () -> {
++        Log.w(TAG, "SystemUI did not connect in " + SERVICE_WAIT_TIMEOUT_MS
++                + "ms, showing the camera without hiding the apps");
++        startShowing();
++    };
++
++    static CameraSession get(Context context) {
++        if (sInstance == null) {
++            sInstance = new CameraSession(context.getApplicationContext());
++        }
++        return sInstance;
++    }
++
++    private CameraSession(Context appContext) {
++        mContext = appContext;
++        mAppArea = new AppAreaClient(appContext, this);
++        mPopups = new TestPopups(appContext, DISPLAY_ID);
++    }
++
++    boolean isOn() {
++        return mState == State.ON || mState == State.WAITING_FOR_SYSTEMUI;
++    }
++
++    void show() {
++        if (mState == State.TURNING_OFF) {
++            mPendingShow = true;
++            return;
++        }
++        if (mState != State.OFF) {
++            Log.i(TAG, "show() ignored in state " + mState);
++            return;
++        }
++        mSessionCount++;
++        mEmulatorTest = CameraTestConfig.isEmulatorTest();
++        mSubCore = CameraTestConfig.createSubCoreClient(mEmulatorTest);
++        SeqLog.step("=== CAMERA ON #" + mSessionCount + " emulatorTest=" + mEmulatorTest
++                + " subCore=" + mSubCore.getClass().getSimpleName());
++        mAppArea.bind();
++        if (mAppArea.isConnected()) {
++            startShowing();
++        } else {
++            mState = State.WAITING_FOR_SYSTEMUI;
++            mHandler.postDelayed(mServiceTimeout, SERVICE_WAIT_TIMEOUT_MS);
++        }
++    }
++
++    private void startShowing() {
++        mHandler.removeCallbacks(mServiceTimeout);
++        mState = State.ON;
++        mCameraShown = false;
++        SeqLog.step("1. hideApps (deferred, applied with the window's first frame)");
++        final SurfaceControl.Transaction hideTx = mAppArea.hideApps(DISPLAY_ID, true);
++        SeqLog.step("2. add camera window (hideTx " + (hideTx != null
++                ? "applied in the same frame" : "null: applied by SystemUI or unavailable")
++                + ")");
++        mWindow = new CameraWindow(mContext, DISPLAY_ID, mEmulatorTest, this);
++        mWindow.show(hideTx);
++    }
++
++    void hide() {
++        switch (mState) {
++            case TURNING_OFF:
++                mPendingShow = false;
++                return;
++            case OFF:
++                Log.i(TAG, "hide() ignored in state " + mState);
++                return;
++            case WAITING_FOR_SYSTEMUI:
++                mHandler.removeCallbacks(mServiceTimeout);
++                mState = State.OFF;
++                SeqLog.step("=== CAMERA OFF before it was shown");
++                return;
++            case ON:
++                break;
++        }
++        mState = State.TURNING_OFF;
++        SeqLog.step("=== CAMERA OFF #" + mSessionCount);
++        if (mCameraShown) {
++            SeqLog.step("1. hideCamera");
++            mSubCore.hideCamera();
++            mCameraShown = false;
++        }
++        mPopups.dismissAll();
++        final SurfaceControl.Transaction showTx = mAppArea.showApps(DISPLAY_ID, true);
++        SeqLog.step("2. camera UI gone + showApps in the same frame (showTx "
++                + (showTx != null ? "deferred" : "null") + ")");
++        final CameraWindow window = mWindow;
++        mWindow = null;
++        window.remove(showTx, () -> {
++            SeqLog.step("3. camera window removed");
++            mState = State.OFF;
++            if (mPendingShow) {
++                mPendingShow = false;
++                show();
++            }
++        });
++    }
++
++    @Override
++    public void onAppAreaServiceConnected(boolean reconnected) {
++        if (mState == State.WAITING_FOR_SYSTEMUI) {
++            startShowing();
++        } else if (mState == State.ON && reconnected) {
++            // SystemUI restarted: WM gave the TDA a new, visible surface. Hide it again.
++            SeqLog.step("SystemUI restarted while camera on -> hideApps again");
++            mAppArea.hideApps(DISPLAY_ID, false);
++        }
++    }
++
++    @Override
++    public void onFirstFrameCommitted(Rect holeRect) {
++        if (mState != State.ON) {
++            return;
++        }
++        SeqLog.step("3. showCamera rect=" + holeRect.toShortString());
++        mSubCore.showCamera(holeRect);
++        mCameraShown = true;
++    }
++
++    @Override
++    public void onHoleRectChanged(Rect holeRect) {
++        if (mState == State.ON && mCameraShown) {
++            SeqLog.step("updateRect rect=" + holeRect.toShortString());
++            mSubCore.updateRect(holeRect);
++        }
++    }
++
++    @Override
++    public void onPopupBelowClicked() {
++        mPopups.toggleBelow();
++    }
++
++    @Override
++    public void onPopupAboveClicked() {
++        mPopups.toggleAbove();
++    }
++
++    @Override
++    public void onOpenActivityClicked() {
++        final Intent intent = new Intent(mContext, TransparencyTestActivity.class)
++                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        Log.i(TAG, "Starting TransparencyTestActivity for the current user");
++        // This app runs as the headless system user; the activity goes to the user in front.
++        mContext.startActivityAsUser(intent, UserHandle.CURRENT);
++    }
++
++    @Override
++    public void onDumpStackClicked() {
++        mBackground.execute(() -> {
++            final String text = TaskStackDumper.dump(DISPLAY_ID);
++            mHandler.post(() -> {
++                if (mWindow != null) {
++                    mWindow.showStackDump(text);
++                }
++            });
++        });
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/CameraTestConfig.java
+@@ -0,0 +1,24 @@
++package com.kane.cameratest;
++
++import android.os.SystemProperties;
++
++import com.android.systemui.car.cameraarea.CameraAppAreaContract;
++import com.kane.cameratest.subcore.RealSubCoreCameraClient;
++import com.kane.cameratest.subcore.SubCoreCameraClient;
++import com.kane.cameratest.subcore.emulator.FakeSubCoreCameraClient;
++
++/** Emulator test mode switch; read each time the camera is turned on. */
++final class CameraTestConfig {
++
++    /** {@code adb shell setprop persist.debug.camera.emulator_test 1} */
++    static boolean isEmulatorTest() {
++        return SystemProperties.getBoolean(CameraAppAreaContract.PROP_EMULATOR_TEST, false);
++    }
++
++    /** Fake (log only) client in emulator test mode, real IPC client otherwise. */
++    static SubCoreCameraClient createSubCoreClient(boolean emulatorTest) {
++        return emulatorTest ? new FakeSubCoreCameraClient() : new RealSubCoreCameraClient();
++    }
++
++    private CameraTestConfig() {}
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/CameraTriggerReceiver.java
+@@ -0,0 +1,45 @@
++package com.kane.cameratest;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.os.UserHandle;
++import android.util.Log;
++
++/**
++ * adb trigger, instead of a reverse-gear signal:
++ * <pre>
++ * adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++ * adb shell am broadcast --user 0 -a com.kane.cameratest.action.HIDE -p com.kane.cameratest
++ * </pre>
++ */
++public class CameraTriggerReceiver extends BroadcastReceiver {
++    private static final String TAG = "CameraTrigger";
++
++    static final String ACTION_SHOW = "com.kane.cameratest.action.SHOW";
++    static final String ACTION_HIDE = "com.kane.cameratest.action.HIDE";
++    static final String ACTION_TOGGLE = "com.kane.cameratest.action.TOGGLE";
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        if (UserHandle.myUserId() != UserHandle.USER_SYSTEM) {
++            // CarSystemUI (the TDA owner) runs as the system user; so does the camera window.
++            Log.w(TAG, "Ignored in user " + UserHandle.myUserId());
++            return;
++        }
++        final CameraSession session = CameraSession.get(context);
++        final String action = intent.getAction();
++        Log.i(TAG, "onReceive " + action);
++        if (ACTION_SHOW.equals(action)) {
++            session.show();
++        } else if (ACTION_HIDE.equals(action)) {
++            session.hide();
++        } else if (ACTION_TOGGLE.equals(action)) {
++            if (session.isOn()) {
++                session.hide();
++            } else {
++                session.show();
++            }
++        }
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/CameraWindow.java
+@@ -0,0 +1,231 @@
++package com.kane.cameratest;
++
++import android.annotation.Nullable;
++import android.content.Context;
++import android.graphics.PixelFormat;
++import android.graphics.Rect;
++import android.hardware.display.DisplayManager;
++import android.util.Log;
++import android.view.ContextThemeWrapper;
++import android.view.Display;
++import android.view.Gravity;
++import android.view.LayoutInflater;
++import android.view.MotionEvent;
++import android.view.SurfaceControl;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.ViewTreeObserver;
++import android.view.WindowInsets;
++import android.view.WindowInsetsController;
++import android.view.WindowManager;
++import android.widget.TextView;
++
++/**
++ * The hole-punch camera window: full screen, translucent, nothing drawn over the hole (alpha 0)
++ * except the guideline and buttons. Hides the status/navigation bars like a fullscreen video:
++ * as a focused system window it is its own insets control target (car's BarControlPolicy only
++ * takes over for application windows).
++ */
++final class CameraWindow {
++    private static final String TAG = "CameraWindow";
++    /** Layer 12: above TYPE_APPLICATION_OVERLAY (11), below IME (13) and the bars (15/24). */
++    @SuppressWarnings("deprecation")
++    static final int WINDOW_TYPE = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
++    /** Safety net in case the frame carrying the "show apps" transaction never commits. */
++    private static final long REMOVE_TIMEOUT_MS = 500;
++
++    interface Callbacks {
++        /** First frame with the hole is on screen: time to tell the sub-core. */
++        void onFirstFrameCommitted(Rect holeRect);
++        void onHoleRectChanged(Rect holeRect);
++        void onPopupBelowClicked();
++        void onPopupAboveClicked();
++        void onOpenActivityClicked();
++        void onDumpStackClicked();
++    }
++
++    private final Context mContext;
++    private final WindowManager mWindowManager;
++    private final Callbacks mCallbacks;
++    private final boolean mShowWallpaper;
++    private final Rect mHoleRect = new Rect();
++    private final int[] mTmpLocation = new int[2];
++
++    private ViewGroup mRoot;
++    private View mHole;
++    private TextView mTouchCounter;
++    private View mStackPanel;
++    private TextView mStackText;
++    private int mHoleTouches;
++    private boolean mFirstFrameCommitted;
++    private boolean mRemoved;
++
++    private final ViewTreeObserver.OnGlobalLayoutListener mLayoutListener = this::updateHoleRect;
++
++    CameraWindow(Context appContext, int displayId, boolean showWallpaper, Callbacks callbacks) {
++        final Display display = appContext.getSystemService(DisplayManager.class)
++                .getDisplay(displayId);
++        final Context windowContext = appContext.createDisplayContext(display)
++                .createWindowContext(WINDOW_TYPE, null);
++        mContext = new ContextThemeWrapper(windowContext, R.style.CameraWindowTheme);
++        mWindowManager = mContext.getSystemService(WindowManager.class);
++        mShowWallpaper = showWallpaper;
++        mCallbacks = callbacks;
++    }
++
++    /**
++     * Adds the window. {@code hideAppsTx} (from SystemUI, may be null) is applied in the same
++     * frame as the window's first frame, so the apps disappear exactly when the hole appears.
++     */
++    void show(@Nullable SurfaceControl.Transaction hideAppsTx) {
++        mRoot = (ViewGroup) LayoutInflater.from(mContext).inflate(R.layout.camera_window, null);
++        mHole = mRoot.findViewById(R.id.camera_hole);
++        mTouchCounter = mRoot.findViewById(R.id.hole_touch_counter);
++        mStackPanel = mRoot.findViewById(R.id.stack_panel);
++        mStackText = mRoot.findViewById(R.id.stack_text);
++        mTouchCounter.setText(mContext.getString(R.string.hole_touch_counter, 0));
++
++        // The hole swallows every touch: nothing may reach the hidden apps.
++        mHole.setOnTouchListener((v, ev) -> {
++            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
++                mHoleTouches++;
++                mTouchCounter.setText(mContext.getString(R.string.hole_touch_counter,
++                        mHoleTouches));
++                Log.i(TAG, "Hole touch #" + mHoleTouches + " at " + (int) ev.getRawX() + ","
++                        + (int) ev.getRawY() + " swallowed");
++            }
++            return true;
++        });
++        mRoot.findViewById(R.id.btn_popup_below).setOnClickListener(
++                v -> mCallbacks.onPopupBelowClicked());
++        mRoot.findViewById(R.id.btn_popup_above).setOnClickListener(
++                v -> mCallbacks.onPopupAboveClicked());
++        mRoot.findViewById(R.id.btn_open_activity).setOnClickListener(
++                v -> mCallbacks.onOpenActivityClicked());
++        mRoot.findViewById(R.id.btn_dump_stack).setOnClickListener(
++                v -> mCallbacks.onDumpStackClicked());
++        mStackText.setOnClickListener(v -> mStackPanel.setVisibility(View.GONE));
++
++        mRoot.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
++            @Override
++            public void onViewAttachedToWindow(View v) {
++                // Runs in the first traversal, before the first draw.
++                if (hideAppsTx != null) {
++                    v.getRootSurfaceControl().applyTransactionOnDraw(hideAppsTx);
++                }
++                v.getViewTreeObserver().registerFrameCommitCallback(() -> {
++                    mFirstFrameCommitted = true;
++                    updateHoleRect();
++                    mCallbacks.onFirstFrameCommitted(new Rect(mHoleRect));
++                });
++            }
++
++            @Override
++            public void onViewDetachedFromWindow(View v) {}
++        });
++
++        mWindowManager.addView(mRoot, createLayoutParams());
++
++        final WindowInsetsController insets = mRoot.getWindowInsetsController();
++        if (insets != null) {
++            insets.setSystemBarsBehavior(
++                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
++            insets.hide(WindowInsets.Type.systemBars());
++        }
++        mRoot.getViewTreeObserver().addOnGlobalLayoutListener(mLayoutListener);
++    }
++
++    private WindowManager.LayoutParams createLayoutParams() {
++        int flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
++                | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
++        if (mShowWallpaper) {
++            // Emulator test mode: the live wallpaper stands in for the camera plane.
++            flags |= WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER;
++        }
++        // Focusable on purpose (no FLAG_NOT_FOCUSABLE): only the focused window may hide the bars.
++        final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
++                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
++                WINDOW_TYPE, flags, PixelFormat.TRANSLUCENT);
++        lp.gravity = Gravity.TOP | Gravity.START;
++        // Lay out under the bars whether they are shown or not: the hole rect never jumps when
++        // the bars slide in/out (e.g. transient swipe).
++        lp.setFitInsetsTypes(0);
++        lp.layoutInDisplayCutoutMode =
++                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
++        // CarSystemUI and this app run as the headless system user; show for the current user.
++        lp.privateFlags |= WindowManager.LayoutParams.SYSTEM_FLAG_SHOW_FOR_ALL_USERS;
++        lp.windowAnimations = 0;
++        lp.setTitle("CameraTestWindow");
++        return lp;
++    }
++
++    private void updateHoleRect() {
++        if (mHole == null || !mHole.isAttachedToWindow()) {
++            return;
++        }
++        mHole.getLocationOnScreen(mTmpLocation);
++        final Rect r = new Rect(mTmpLocation[0], mTmpLocation[1],
++                mTmpLocation[0] + mHole.getWidth(), mTmpLocation[1] + mHole.getHeight());
++        if (r.equals(mHoleRect)) {
++            return;
++        }
++        mHoleRect.set(r);
++        if (mFirstFrameCommitted) {
++            mCallbacks.onHoleRectChanged(new Rect(r));
++        }
++    }
++
++    void showStackDump(String text) {
++        if (mRoot == null) {
++            return;
++        }
++        mStackText.setText(text);
++        mStackPanel.setVisibility(View.VISIBLE);
++    }
++
++    /**
++     * Removes the window. If {@code showAppsTx} is given, the apps reappear in the same frame in
++     * which the camera UI disappears (the window is still there but draws nothing), and the
++     * window is removed once that frame has been committed.
++     */
++    void remove(@Nullable SurfaceControl.Transaction showAppsTx, Runnable onRemoved) {
++        if (mRoot == null || mRemoved) {
++            if (showAppsTx != null) {
++                showAppsTx.apply();
++            }
++            onRemoved.run();
++            return;
++        }
++        mRoot.getViewTreeObserver().removeOnGlobalLayoutListener(mLayoutListener);
++        if (showAppsTx == null || !mRoot.isAttachedToWindow()) {
++            if (showAppsTx != null) {
++                showAppsTx.apply();
++            }
++            removeNow(onRemoved);
++            return;
++        }
++        // Children only: hiding the root would relayout the window and hide its surface in a
++        // different transaction than the one showing the apps.
++        for (int i = 0; i < mRoot.getChildCount(); i++) {
++            mRoot.getChildAt(i).setVisibility(View.INVISIBLE);
++        }
++        final Runnable remove = () -> removeNow(onRemoved);
++        showAppsTx.addTransactionCommittedListener(mContext.getMainExecutor(), remove::run);
++        mRoot.getRootSurfaceControl().applyTransactionOnDraw(showAppsTx);
++        mRoot.invalidate();
++        mRoot.postDelayed(remove, REMOVE_TIMEOUT_MS);
++    }
++
++    private void removeNow(Runnable onRemoved) {
++        if (mRemoved) {
++            return;
++        }
++        mRemoved = true;
++        mWindowManager.removeViewImmediate(mRoot);
++        onRemoved.run();
++    }
++
++    Rect getHoleRect() {
++        return new Rect(mHoleRect);
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/GuidelineView.java
+@@ -0,0 +1,46 @@
++package com.kane.cameratest;
++
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Paint;
++import android.util.AttributeSet;
++import android.view.View;
++
++/** Rear-camera parking guideline drawn over the (transparent) camera hole. No background. */
++public class GuidelineView extends View {
++    private static final int[] COLORS = {0xFF00E676, 0xFFFFEA00, 0xFFFF1744};
++
++    private final Paint mPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++
++    public GuidelineView(Context context, AttributeSet attrs) {
++        super(context, attrs);
++        mPaint.setStyle(Paint.Style.STROKE);
++        mPaint.setStrokeWidth(8f * getResources().getDisplayMetrics().density);
++        mPaint.setStrokeCap(Paint.Cap.ROUND);
++    }
++
++    @Override
++    protected void onDraw(Canvas canvas) {
++        final float w = getWidth();
++        final float h = getHeight();
++        // Trapezoid from the bottom (near) to the horizon (far), split into 3 distance bands.
++        final float nearY = h * 0.95f;
++        final float farY = h * 0.45f;
++        final float nearHalf = w * 0.30f;
++        final float farHalf = w * 0.14f;
++        final float cx = w * 0.5f;
++        for (int i = 0; i < COLORS.length; i++) {
++            final float t0 = i / 3f;
++            final float t1 = (i + 1) / 3f;
++            final float y0 = nearY + (farY - nearY) * t0;
++            final float y1 = nearY + (farY - nearY) * t1;
++            final float half0 = nearHalf + (farHalf - nearHalf) * t0;
++            final float half1 = nearHalf + (farHalf - nearHalf) * t1;
++            mPaint.setColor(COLORS[i]);
++            canvas.drawLine(cx - half0, y0, cx - half1, y1, mPaint);
++            canvas.drawLine(cx + half0, y0, cx + half1, y1, mPaint);
++            canvas.drawLine(cx - half1, y1, cx - half1 * 0.6f, y1, mPaint);
++            canvas.drawLine(cx + half1, y1, cx + half1 * 0.6f, y1, mPaint);
++        }
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/SeqLog.java
+@@ -0,0 +1,17 @@
++package com.kane.cameratest;
++
++import android.os.SystemClock;
++import android.util.Log;
++
++import java.util.Locale;
++
++/** Logs the on/off sequence steps under one tag so their order is easy to check. */
++final class SeqLog {
++    static final String TAG = "CamSeq";
++
++    static void step(String msg) {
++        Log.i(TAG, String.format(Locale.US, "uptime=%dms %s", SystemClock.uptimeMillis(), msg));
++    }
++
++    private SeqLog() {}
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/TaskStackDumper.java
+@@ -0,0 +1,116 @@
++package com.kane.cameratest;
++
++import android.app.ActivityTaskManager;
++import android.app.WindowConfiguration;
++import android.os.IBinder;
++import android.os.ParcelFileDescriptor;
++import android.os.RemoteException;
++import android.os.ServiceManager;
++import android.util.Log;
++
++import java.io.BufferedReader;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.util.List;
++
++/**
++ * Button 4: which tasks/activities are in the stack right now. Two parts:
++ * root tasks from ActivityTaskManager (top first), then every activity record per task from
++ * {@code dumpsys activity activities}. Call off the main thread (the dump can take a while).
++ */
++final class TaskStackDumper {
++    private static final String TAG = "CameraTest/Stack";
++
++    static String dump(int displayId) {
++        final StringBuilder sb = new StringBuilder();
++        appendRootTasks(sb, displayId);
++        sb.append('\n');
++        appendActivityRecords(sb);
++        final String text = sb.toString();
++        for (String line : text.split("\n")) {
++            Log.i(TAG, line);
++        }
++        return text;
++    }
++
++    private static void appendRootTasks(StringBuilder sb, int displayId) {
++        final List<ActivityTaskManager.RootTaskInfo> rootTasks;
++        try {
++            rootTasks = ActivityTaskManager.getService().getAllRootTaskInfosOnDisplay(displayId);
++        } catch (RemoteException | SecurityException e) {
++            sb.append("getAllRootTaskInfosOnDisplay failed: ").append(e).append('\n');
++            return;
++        }
++        sb.append("== Root tasks on display ").append(displayId).append(" (top first): ")
++                .append(rootTasks.size()).append('\n');
++        for (int i = 0; i < rootTasks.size(); i++) {
++            final ActivityTaskManager.RootTaskInfo rt = rootTasks.get(i);
++            final WindowConfiguration wc = rt.configuration.windowConfiguration;
++            sb.append(String.format("#%d rootTask=%d %s/%s visible=%b activities=%d\n",
++                    i, rt.taskId,
++                    WindowConfiguration.windowingModeToString(wc.getWindowingMode()),
++                    WindowConfiguration.activityTypeToString(wc.getActivityType()),
++                    rt.visible, rt.numActivities));
++            sb.append("     top=").append(shortName(rt.topActivity)).append('\n');
++            if (rt.childTaskIds != null) {
++                for (int j = 0; j < rt.childTaskIds.length; j++) {
++                    sb.append(String.format("     task %d u%d %s\n", rt.childTaskIds[j],
++                            rt.childTaskUserIds[j], rt.childTaskNames[j]));
++                }
++            }
++        }
++    }
++
++    /** Task and "Hist" (activity record) lines of dumpsys activity activities, in z-order. */
++    private static void appendActivityRecords(StringBuilder sb) {
++        sb.append("== Activities per task (dumpsys activity activities)\n");
++        final IBinder am = ServiceManager.getService("activity");
++        if (am == null) {
++            sb.append("activity service not found\n");
++            return;
++        }
++        ParcelFileDescriptor[] pipe = null;
++        try {
++            pipe = ParcelFileDescriptor.createPipe();
++            am.dumpAsync(pipe[1].getFileDescriptor(), new String[] {"activities"});
++            pipe[1].close();
++            pipe[1] = null;
++            try (BufferedReader r = new BufferedReader(new InputStreamReader(
++                    new FileInputStream(pipe[0].getFileDescriptor())))) {
++                String line;
++                while ((line = r.readLine()) != null) {
++                    final String t = line.trim();
++                    if (t.startsWith("* Task{") || t.startsWith("* Hist")
++                            || t.startsWith("TaskDisplayArea ")) {
++                        sb.append(line).append('\n');
++                    }
++                }
++            }
++        } catch (IOException | RemoteException e) {
++            sb.append("dump failed: ").append(e).append('\n');
++        } finally {
++            closeQuietly(pipe);
++        }
++    }
++
++    private static String shortName(android.content.ComponentName cn) {
++        return cn == null ? "null" : cn.flattenToShortString();
++    }
++
++    private static void closeQuietly(ParcelFileDescriptor[] pipe) {
++        if (pipe == null) {
++            return;
++        }
++        for (ParcelFileDescriptor pfd : pipe) {
++            if (pfd != null) {
++                try {
++                    pfd.close();
++                } catch (IOException ignored) {
++                }
++            }
++        }
++    }
++
++    private TaskStackDumper() {}
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/TestPopups.java
+@@ -0,0 +1,125 @@
++package com.kane.cameratest;
++
++import android.annotation.Nullable;
++import android.content.Context;
++import android.graphics.PixelFormat;
++import android.hardware.display.DisplayManager;
++import android.util.Log;
++import android.util.TypedValue;
++import android.view.Display;
++import android.view.Gravity;
++import android.view.View;
++import android.view.WindowManager;
++import android.widget.TextView;
++
++/**
++ * Popups for z-order tests around the camera window (layer 12):
++ * <ul>
++ *   <li>below: TYPE_APPLICATION_OVERLAY (layer 11) - outside the TDA, so hiding the TDA does
++ *       not hide it and it shows through the transparent hole;</li>
++ *   <li>above: TYPE_SYSTEM_ERROR (layer 27) - always drawn over the camera UI.</li>
++ * </ul>
++ * Both are NOT_FOCUSABLE so the camera window keeps focus (and keeps the bars hidden).
++ */
++final class TestPopups {
++    private static final String TAG = "TestPopups";
++
++    private final Context mAppContext;
++    private final Display mDisplay;
++
++    @Nullable
++    private Popup mBelow;
++    @Nullable
++    private Popup mAbove;
++
++    TestPopups(Context appContext, int displayId) {
++        mAppContext = appContext;
++        mDisplay = appContext.getSystemService(DisplayManager.class).getDisplay(displayId);
++    }
++
++    void toggleBelow() {
++        if (mBelow != null) {
++            mBelow.dismiss();
++            mBelow = null;
++            return;
++        }
++        mBelow = new Popup(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++                R.string.popup_below_text, 0xE6D32F2F, /* yOffsetDp= */ 140,
++                /* touchable= */ false);
++    }
++
++    void toggleAbove() {
++        if (mAbove != null) {
++            mAbove.dismiss();
++            mAbove = null;
++            return;
++        }
++        mAbove = new Popup(WindowManager.LayoutParams.TYPE_SYSTEM_ERROR,
++                R.string.popup_above_text, 0xE62E7D32, /* yOffsetDp= */ -140,
++                /* touchable= */ true);
++    }
++
++    void dismissAll() {
++        if (mBelow != null) {
++            mBelow.dismiss();
++            mBelow = null;
++        }
++        if (mAbove != null) {
++            mAbove.dismiss();
++            mAbove = null;
++        }
++    }
++
++    private final class Popup {
++        private final WindowManager mWm;
++        private final View mView;
++        private final String mName;
++
++        @SuppressWarnings("deprecation")
++        Popup(int type, int textRes, int color, int yOffsetDp, boolean touchable) {
++            final Context ctx = mAppContext.createDisplayContext(mDisplay)
++                    .createWindowContext(type, null);
++            mWm = ctx.getSystemService(WindowManager.class);
++            mName = type == WindowManager.LayoutParams.TYPE_SYSTEM_ERROR ? "above" : "below";
++
++            final float density = ctx.getResources().getDisplayMetrics().density;
++            final TextView tv = new TextView(ctx);
++            tv.setText(textRes);
++            tv.setTextColor(0xFFFFFFFF);
++            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
++            tv.setGravity(Gravity.CENTER);
++            tv.setBackgroundColor(color);
++            final int pad = (int) (24 * density);
++            tv.setPadding(pad, pad, pad, pad);
++            mView = tv;
++
++            int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
++            if (touchable) {
++                tv.setOnClickListener(v -> {
++                    // Only the "above" popup is touchable: tapping it closes it.
++                    if (mAbove == this) {
++                        toggleAbove();
++                    }
++                });
++            } else {
++                flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
++            }
++            final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
++                    (int) (640 * density), WindowManager.LayoutParams.WRAP_CONTENT, type, flags,
++                    PixelFormat.TRANSLUCENT);
++            lp.gravity = Gravity.CENTER;
++            lp.y = (int) (yOffsetDp * density);
++            lp.setFitInsetsTypes(0);
++            lp.privateFlags |= WindowManager.LayoutParams.SYSTEM_FLAG_SHOW_FOR_ALL_USERS;
++            lp.setTitle("CameraTestPopup-" + mName);
++            mWm.addView(mView, lp);
++            Log.i(TAG, "Popup " + mName + " shown");
++        }
++
++        void dismiss() {
++            mWm.removeViewImmediate(mView);
++            Log.i(TAG, "Popup " + mName + " dismissed");
++        }
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/TransparencyTestActivity.java
+@@ -0,0 +1,34 @@
++package com.kane.cameratest;
++
++import android.app.Activity;
++import android.os.Bundle;
++import android.util.Log;
++
++/**
++ * Button 3. An opaque, bright activity. It lands in the DefaultTaskDisplayArea, which is hidden
++ * while the camera is on, so it must NOT be visible through the hole. It must appear once the
++ * camera is turned off.
++ */
++public class TransparencyTestActivity extends Activity {
++    private static final String TAG = "TransparencyTest";
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        setContentView(R.layout.activity_transparency_test);
++        findViewById(R.id.transparency_close).setOnClickListener(v -> finish());
++        Log.i(TAG, "onCreate task=" + getTaskId());
++    }
++
++    @Override
++    protected void onResume() {
++        super.onResume();
++        Log.i(TAG, "onResume");
++    }
++
++    @Override
++    protected void onPause() {
++        super.onPause();
++        Log.i(TAG, "onPause");
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/subcore/RealSubCoreCameraClient.java
+@@ -0,0 +1,28 @@
++package com.kane.cameratest.subcore;
++
++import android.graphics.Rect;
++import android.util.Log;
++
++/**
++ * STUB: the real IPC to the sub-core is not implemented yet. Replace the bodies with the vendor
++ * IPC (HIDL/AIDL HAL, rpmsg, ...). Must not block the main thread for long: the camera window
++ * waits for these calls.
++ */
++public final class RealSubCoreCameraClient implements SubCoreCameraClient {
++    private static final String TAG = "RealSubCore";
++
++    @Override
++    public void showCamera(Rect rectOnScreen) {
++        Log.w(TAG, "TODO IPC showCamera " + rectOnScreen.toShortString());
++    }
++
++    @Override
++    public void hideCamera() {
++        Log.w(TAG, "TODO IPC hideCamera");
++    }
++
++    @Override
++    public void updateRect(Rect rectOnScreen) {
++        Log.w(TAG, "TODO IPC updateRect " + rectOnScreen.toShortString());
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/subcore/SubCoreCameraClient.java
+@@ -0,0 +1,18 @@
++package com.kane.cameratest.subcore;
++
++import android.graphics.Rect;
++
++/**
++ * Commands to the sub-core (RTOS/Linux) that scans the camera image out on its own hardware
++ * plane under Android. Rects are in display pixels, from the hole view's on-screen position.
++ */
++public interface SubCoreCameraClient {
++    /** Starts showing the camera image in {@code rectOnScreen}. */
++    void showCamera(Rect rectOnScreen);
++
++    /** Stops showing the camera image. */
++    void hideCamera();
++
++    /** The hole moved or was resized while the camera is shown. */
++    void updateRect(Rect rectOnScreen);
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/CameraTestApp/src/com/kane/cameratest/subcore/emulator/FakeSubCoreCameraClient.java
+@@ -0,0 +1,43 @@
++package com.kane.cameratest.subcore.emulator;
++
++import android.graphics.Rect;
++import android.os.SystemClock;
++import android.util.Log;
++
++import com.kane.cameratest.subcore.SubCoreCameraClient;
++
++import java.util.Locale;
++
++/**
++ * Emulator-only stand-in for the sub-core: there is no hardware plane, the live wallpaper plays
++ * that role. Only logs every command with its arguments and timestamps so the command order can
++ * be checked:
++ * <pre>adb logcat -s FakeSubCore:I CamSeq:I CameraAppArea:I</pre>
++ */
++public final class FakeSubCoreCameraClient implements SubCoreCameraClient {
++    private static final String TAG = "FakeSubCore";
++
++    private int mSeq;
++
++    @Override
++    public void showCamera(Rect rectOnScreen) {
++        log("showCamera rect=" + rectOnScreen.toShortString()
++                + " size=" + rectOnScreen.width() + "x" + rectOnScreen.height());
++    }
++
++    @Override
++    public void hideCamera() {
++        log("hideCamera");
++    }
++
++    @Override
++    public void updateRect(Rect rectOnScreen) {
++        log("updateRect rect=" + rectOnScreen.toShortString()
++                + " size=" + rectOnScreen.width() + "x" + rectOnScreen.height());
++    }
++
++    private void log(String cmd) {
++        Log.i(TAG, String.format(Locale.US, "#%d uptime=%dms wall=%d %s",
++                ++mSeq, SystemClock.uptimeMillis(), System.currentTimeMillis(), cmd));
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/README.md
+@@ -0,0 +1,325 @@
++# Camera hole-punch: ẩn app dưới window camera (AAOS 14, phương án B)
++
++Bản build đích: Android 14 `UP1A.231005.007`, `sdk_car_x86_64-userdebug`, emulator
++`emulator_car_x86_64`, có bật headless system user (HSUM).
++
++## 1. Kiến trúc
++
++```
++ app camera (com.kane.cameratest, chạy ở user 0)     CarSystemUI (user 0)
++ ┌──────────────────────────────┐   binder    ┌─────────────────────────────────┐
++ │ CameraSession (máy trạng thái)│ ─────────► │ CameraAppAreaService            │
++ │ CameraWindow (TYPE_SYSTEM_ALERT)│ hide/show │   └ CameraAppAreaController     │
++ │ SubCoreCameraClient ──► sub-core│ Apps     │       └ RootTaskDisplayAreaOrg. │
++ └──────────────────────────────┘            │         (WMShell, giữ leash TDA)│
++                                              └─────────────────────────────────┘
++```
++
++* **CarSystemUI chỉ làm một việc:** ẩn/hiện leash của `DefaultTaskDisplayArea`, dùng lại
++  organizer `RootTaskDisplayAreaOrganizer` có sẵn của WMShell. Không đăng ký organizer thứ hai,
++  vì WM sẽ âm thầm thay organizer cũ và làm hỏng Shell.
++* **App camera giữ trạng thái và UI.** Nếu app camera chết, SystemUI (qua `linkToDeath`) tự hiện
++  lại app. Nếu SystemUI chết, WM cấp cho TDA một surface mới đang hiện; app camera reconnect rồi
++  gọi `hideApps` lại.
++
++### Thứ tự lệnh
++
++| Bật camera | Tắt camera |
++|---|---|
++| 1. `hideApps` (transaction được trả về cho app camera, không apply ngay) | 1. `hideCamera()` gửi sub-core |
++| 2. add window camera; transaction ẩn TDA được apply **cùng frame đầu tiên** của window | 2. ẩn UI camera và `showApps` **trong cùng một frame** (window vẫn còn nhưng không vẽ gì) |
++| 3. `showCamera(rect)` sau khi frame đầu tiên đã commit | 3. gỡ window sau khi frame đó đã commit |
++
++Bước 2 dùng `AttachedSurfaceControl.applyTransactionOnDraw()`, nên không có frame nào lộ app hoặc
++bị trống.
++
++### Ẩn status bar và nav bar
++Window camera là window hệ thống và đang giữ focus, nên WM giao quyền điều khiển insets cho chính
++nó. (`BarControlPolicy` của CarSystemUI chỉ can thiệp khi window đang focus là window app, type
++1–99.) Vì vậy chỉ cần `WindowInsetsController.hide(systemBars())`, giống app xem video full màn
++hình. Vuốt từ mép màn hình sẽ hiện thanh tạm thời (`BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`).
++
++### Thứ tự layer (theo `WindowManagerPolicy`)
++| Layer | Thành phần |
++|---|---|
++| 1 | Wallpaper, nằm ngoài TDA (khi test trên emulator, đây là **plane camera giả**) |
++| 2 | DefaultTaskDisplayArea, gồm mọi activity, **bị ẩn khi camera bật** |
++| 11 | Popup DƯỚI (`TYPE_APPLICATION_OVERLAY`), nút 1 |
++| 12 | **Window camera** (`TYPE_SYSTEM_ALERT`) |
++| 13 | IME |
++| 15 / 24 | Status bar / nav bar (đang bị ẩn) |
++| 27 | Popup TRÊN (`TYPE_SYSTEM_ERROR`), nút 2 |
++
++## 2. Các file và lý do sửa
++
++| File | Lý do |
++|---|---|
++| `frameworks/base/libs/WindowManager/Shell/.../RootTaskDisplayAreaOrganizer.java` | Thêm `setDisplayAreaVisibility()`. Leash TDA là `private` và chỉ organizer của Shell được giữ. |
++| `packages/apps/Car/SystemUI/libs/camera-app-area/` (mới) | `ICameraAppArea.aidl` + `CameraAppAreaContract`, thư viện dùng chung cho SystemUI và app camera. |
++| `packages/apps/Car/SystemUI/src/.../car/cameraarea/CameraAppAreaController.java` (mới) | `CoreStartable`: lấy leash qua `registerListener`, lưu trạng thái mong muốn theo display, áp dụng lại khi leash xuất hiện, `linkToDeath` client. Chạy trên thread Shell (car bật `config_enableShellMainThread`). |
++| `.../cameraarea/CameraAppAreaService.java` (mới) | Binder cho app camera, kiểm tra permission ở mỗi lần gọi. |
++| `.../cameraarea/CameraAppAreaModule.java` (mới) | Dagger: đăng ký `CoreStartable` và `Service`. |
++| `packages/apps/Car/SystemUI/src/.../CarSysUIComponent.java` | Thêm `CameraAppAreaModule`. |
++| `packages/apps/Car/SystemUI/AndroidManifest.xml` | Định nghĩa permission `signature` `CONTROL_CAMERA_APP_AREA` và khai báo service. |
++| `packages/apps/Car/SystemUI/Android.bp` | Link `car-camera-app-area-aidl`. |
++| `vendor/kane/cameratest/CameraTestApp` (mới) | App camera test: window, 4 nút, sub-core client (fake/stub), trigger qua adb. |
++| `vendor/kane/cameratest/TestPatternWallpaper` (mới, **chỉ test**) | Live wallpaper test pattern, đóng vai plane camera. |
++| `vendor/kane/cameratest/TouchTestApp` (mới, **chỉ test**) | Lưới nút ghi log, dùng cho test touch. |
++| `vendor/kane/cameratest/overlay/EmulatorWallpaperOverlay` (mới, **chỉ test**) | Bật lại `config_enableWallpaperService`. Bản car tắt wallpaper service mặc định. |
++| `vendor/kane/cameratest/privapp/` | privapp-permissions. |
++| `vendor/kane/cameratest/cameratest.mk` | Danh sách `PRODUCT_PACKAGES`. |
++
++Quyền của app camera (ký platform, privileged, cài vào `system_ext`):
++`CONTROL_CAMERA_APP_AREA`, `INTERNAL_SYSTEM_WINDOW`, `SYSTEM_ALERT_WINDOW`,
++`MANAGE_ACTIVITY_TASKS`, `DUMP`, `INTERACT_ACROSS_USERS(_FULL)`,
++`START_ACTIVITIES_FROM_BACKGROUND`. App camera không cần đăng ký organizer, nên dùng
++`MANAGE_ACTIVITY_TASKS` chỉ để liệt kê task (nút 4).
++
++## 3. Build và cài lên emulator
++
++### 3.1 Đưa patch vào cây AOSP (trong máy ảo)
++```bash
++bash apply_to_aosp.sh ./aosp_patch /home/vboxuser/aosp --dry-run
++bash apply_to_aosp.sh ./aosp_patch /home/vboxuser/aosp
++```
++Thêm 1 dòng vào `vendor/kane/products/kane_car.mk`:
++```make
++$(call inherit-product, vendor/kane/cameratest/cameratest.mk)
++```
++
++### 3.2 Build
++```bash
++cd /home/vboxuser/aosp
++source build/envsetup.sh
++lunch sdk_car_x86_64-userdebug
++m -j$(nproc)
++```
++Lần đầu nên build full (`m`), vì có thêm package mới vào product. Các lần sau chỉ cần build
++những module đã đổi. WMShell được build tĩnh vào SystemUI, nên sửa `RootTaskDisplayAreaOrganizer`
++thì chỉ cần build lại `CarSystemUI`.
++```bash
++m CarSystemUI KaneCameraTest KaneTestPatternWallpaper KaneTouchTest \
++  KaneCameraTestFrameworkOverlay privapp-permissions-kane-cameratest.xml
++```
++
++### 3.3 Chạy emulator và đẩy bản build lên
++Lần đầu sau khi build full:
++```bash
++emulator -writable-system -no-snapshot &
++```
++Khi chỉ cần đẩy lại module đã sửa (emulator phải chạy với `-writable-system`):
++```bash
++adb root
++adb remount          # lần đầu có thể yêu cầu: adb reboot && adb root && adb remount
++adb sync system_ext  # CarSystemUI, KaneCameraTest, wallpaper, touch app, privapp xml
++adb sync product     # overlay bật wallpaper service
++adb reboot
++```
++Đường dẫn khi cài: `/system_ext/priv-app/CarSystemUI/`, `/system_ext/priv-app/KaneCameraTest/`,
++`/system_ext/priv-app/KaneTestPatternWallpaper/`, `/system_ext/app/KaneTouchTest/`,
++`/system_ext/etc/permissions/privapp-permissions-kane-cameratest.xml`,
++`/product/overlay/KaneCameraTestFrameworkOverlay.apk`.
++
++Kiểm tra sau khi boot:
++```bash
++adb shell pm list packages | grep -E "kane|systemui"
++adb shell cmd overlay list android | grep Kane            # phải là [x]
++adb shell dumpsys package com.kane.cameratest | grep -E "INTERNAL_SYSTEM_WINDOW|CONTROL_CAMERA_APP_AREA"
++```
++
++## 4. Bật chế độ test emulator
++```bash
++adb root
++adb shell setprop persist.debug.camera.emulator_test 1
++adb shell getprop persist.debug.camera.emulator_test        # phải in ra 1
++# Đặt live wallpaper test pattern cho user đang dùng (HSUM: user 10)
++adb shell am broadcast --user current -a com.kane.testpattern.action.SET -p com.kane.testpattern
++adb logcat -d -s TestPattern
++```
++Property này quyết định 2 việc (đọc lại mỗi lần bật camera, không cần reboot):
++
++| | `=1` (test emulator) | `=0` hoặc chưa đặt (chạy thật) |
++|---|---|---|
++| Sub-core client | `FakeSubCoreCameraClient` (chỉ ghi log) | `RealSubCoreCameraClient` (**stub**) |
++| Window camera | có `FLAG_SHOW_WALLPAPER` (wallpaper là plane giả) | không có |
++| Wallpaper | giữ nguyên | không dùng (bản car tắt wallpaper service; SystemUI ghi cảnh báo nếu nó đang bật) |
++
++> **SELinux:** nếu `CamSeq` in ra `emulatorTest=false` dù đã setprop, chạy
++> `adb logcat -d | grep avc | grep emulator_test`. Nếu có denial thì tạm thời dùng
++> `adb shell setenforce 0`, hoặc thêm sepolicy cho property.
++
++## 5. Bật/tắt camera bằng adb
++```bash
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW   -p com.kane.cameratest
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.HIDE   -p com.kane.cameratest
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.TOGGLE -p com.kane.cameratest
++```
++Theo dõi log:
++```bash
++adb logcat -s CamSeq:I FakeSubCore:I CameraAppArea:I AppAreaClient:I CameraWindow:I
++```
++Kết quả mong đợi khi bật rồi tắt:
++```
++CamSeq        : === CAMERA ON #1 emulatorTest=true subCore=FakeSubCoreCameraClient
++CamSeq        : 1. hideApps (deferred, applied with the window's first frame)
++CameraAppArea : hideApps display=0 deferApply=true
++CamSeq        : 2. add camera window (hideTx applied in the same frame)
++CamSeq        : 3. showCamera rect=[0,0][1920,1080]
++FakeSubCore   : #1 uptime=...ms wall=... showCamera rect=[0,0][1920,1080] size=1920x1080
++CamSeq        : === CAMERA OFF #1
++CamSeq        : 1. hideCamera
++FakeSubCore   : #2 ... hideCamera
++CameraAppArea : showApps display=0 deferApply=true
++CamSeq        : 2. camera UI gone + showApps in the same frame (showTx deferred)
++CamSeq        : 3. camera window removed
++```
++
++Bốn nút trên màn camera:
++1. **Popup DƯỚI** (layer 11, nằm ngoài TDA): sẽ **thấy được qua lỗ**. Đây là giới hạn đã biết.
++   Window hệ thống nằm dưới window camera không bị ẩn theo TDA.
++2. **Popup TRÊN** (layer 27): luôn nằm trên nút và guideline. Chạm vào popup để đóng.
++3. **Mở Activity**: start `TransparencyTestActivity` (màu hồng) cho user hiện tại. Khi camera
++   bật thì **không được thấy** activity này; tắt camera thì nó phải hiện ra.
++4. **Activity trong stack**: hiện danh sách root task (task trên cùng in trước) và mọi
++   `ActivityRecord` theo task (lọc từ `dumpsys activity activities`). Đồng thời ghi ra logcat
++   với tag `CameraTest/Stack`. Chạm vào bảng để đóng.
++
++## 6. Kịch bản test
++
++Trước mỗi kịch bản: chế độ test đã bật (mục 4) và log đang chạy.
++
++### 6.1 Cây DisplayArea và organizer
++```bash
++adb shell dumpsys window containers | grep -nE "DisplayArea|Leaf:0:1|WallpaperWindowToken"
++adb shell dumpsys activity service com.android.systemui/.SystemUIService CameraAppAreaController
++adb shell dumpsys activity service com.android.systemui/.SystemUIService WMShell | grep -A3 RootTaskDisplayAreaOrganizer
++```
++Mong đợi:
++* `Leaf:0:1` (chứa wallpaper) nằm **dưới** `DefaultTaskDisplayArea`.
++* Dump của `CameraAppAreaController` có `available=true` và
++  `display=0 appsHidden=false leashReady=true`.
++* Chỉ có một organizer cho TDA, là của WMShell. Log không có dòng
++  `Replacing dead organizer for feature=1` (`adb logcat -d | grep "Replacing dead organizer"`).
++
++### 6.2 SurfaceFlinger khi camera bật
++```bash
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++adb shell dumpsys SurfaceFlinger > sf_on.txt
++grep -n -A12 "DefaultTaskDisplayArea" sf_on.txt | grep -iE "DefaultTaskDisplayArea|flags=|hidden"
++grep -n -A12 "CameraTestWindow" sf_on.txt | grep -iE "CameraTestWindow|isOpaque"
++adb exec-out screencap -p > cam_on.png
++```
++Mong đợi:
++* Layer `DefaultTaskDisplayArea` ở trạng thái hidden: `flags=` có bit `0x1` (eLayerHidden),
++  hoặc có chữ `hidden`, tùy định dạng dump.
++* Layer `CameraTestWindow` có `isOpaque=0`.
++* Ảnh `cam_on.png` thấy test pattern có timestamp đang chạy, các nút và guideline; không thấy
++  launcher hay app; không có status bar và nav bar.
++
++Tắt camera rồi dump lại: TDA không còn hidden, layer `CameraTestWindow` biến mất.
++
++### 6.3 Touch
++```bash
++adb shell am start --user current -n com.kane.touchtest/.TouchTestActivity
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++adb shell input tap 960 540        # chạm vào vùng lỗ, chỗ có nút của TouchTest
++adb shell input keyevent BACK      # phím Back cũng phải bị nuốt
++adb logcat -d -s TouchTest:I CameraWindow:I CamSeq:I
++```
++Mong đợi: có dòng `CameraWindow: Hole touch #1 at 960,540 swallowed` và
++`BACK swallowed by camera window`; **không có** dòng `TouchTest: CLICK`. Bộ đếm trên màn hình
++tăng lên. Tắt camera rồi tap lại thì phải có `TouchTest: CLICK button N`.
++
++### 6.4 Rect khi đổi độ phân giải / density
++```bash
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++adb shell wm size 1280x720
++adb shell wm density 120
++adb shell wm size reset
++adb shell wm density reset
++adb logcat -d -s FakeSubCore:I
++```
++Mong đợi: sau mỗi lần `wm size`, có một dòng `updateRect rect=[0,0][1280,720] size=1280x720`
++(và quay về kích thước gốc khi reset). Chỉ đổi `wm density` thì rect tính bằng pixel không đổi,
++nên **không có** `updateRect`. Đây là hành vi đúng.
++
++### 6.5 Guard: app khác được mở trong lúc camera bật
++```bash
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++adb shell am start --user current -a android.settings.SETTINGS
++```
++Mong đợi:
++* Settings **không** hiện qua lỗ, status bar và nav bar vẫn ẩn, window camera vẫn giữ focus
++  (`adb shell dumpsys window | grep mCurrentFocus` trả về `CameraTestWindow`).
++* Nút 4 cho thấy Settings đã nằm trên cùng của stack.
++* Tắt camera thì Settings hiện ra.
++* Làm tương tự với nút 3 (`TransparencyTestActivity`).
++
++### 6.6 Độ bền: bật/tắt 50 lần
++```bash
++adb shell dumpsys SurfaceFlinger --list | wc -l     # ghi lại số layer TRƯỚC
++adb logcat -c
++for i in $(seq 1 50); do
++  adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest > /dev/null
++  sleep 1.5
++  adb shell am broadcast --user 0 -a com.kane.cameratest.action.HIDE -p com.kane.cameratest > /dev/null
++  sleep 1.5
++done
++adb logcat -d -s CamSeq:I | grep -c "camera window removed"          # = 50
++adb logcat -d | grep -E "FATAL|AndroidRuntime|Shell thread call failed"  # không có dòng nào
++adb shell dumpsys window windows | grep -c CameraTestWindow           # = 0
++adb shell dumpsys SurfaceFlinger --list | wc -l                       # xấp xỉ số TRƯỚC
++adb shell dumpsys meminfo --user 0 com.kane.cameratest | grep -E "Views|ViewRootImpl"   # ViewRootImpl: 0
++adb shell dumpsys activity service com.android.systemui/.SystemUIService CameraAppAreaController
++```
++Mong đợi: dòng cuối cùng in ra `appsHidden=false client=null`.
++
++### 6.7 Kill SystemUI trong lúc camera bật
++```bash
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++adb shell pkill -f com.android.systemui
++adb logcat -s AppAreaClient:I CamSeq:I CameraAppArea:I
++```
++Mong đợi:
++```
++AppAreaClient : SystemUI disconnected; waiting for it to restart
++AppAreaClient : Connected to SystemUI (reconnected=true)
++CamSeq        : SystemUI restarted while camera on -> hideApps again
++CameraAppArea : hideApps display=0 deferApply=false     (hoặc "leash not ready, deferred" rồi "leashAppeared")
++```
++Trong khoảng SystemUI đang khởi động lại (1–3 giây), app sẽ **lộ qua lỗ**, vì WM đã cấp cho
++TDA một surface mới đang hiện. Đây là giới hạn của phương án B (xem mục 7). Sau đó TDA bị ẩn lại;
++tắt camera thì app hiện lại bình thường.
++
++### 6.8 Kill app camera trong lúc camera bật (failsafe)
++```bash
++adb shell am broadcast --user 0 -a com.kane.cameratest.action.SHOW -p com.kane.cameratest
++adb shell am force-stop --user 0 com.kane.cameratest
++adb logcat -d -s CameraAppArea:W
++```
++Mong đợi: có dòng `Camera client died, showing apps on display 0`, và launcher/app hiện lại ngay.
++App camera là `persistent`, nên hệ thống tự khởi động lại tiến trình ngay sau đó; camera ở trạng
++thái tắt cho tới lệnh SHOW tiếp theo. Có thể dùng
++`adb shell kill $(adb shell pidof com.kane.cameratest)` thay cho `force-stop`.
++
++## 7. Giới hạn và những phần còn để stub
++
++**Còn là stub hoặc chưa làm:**
++* `RealSubCoreCameraClient`: IPC thật tới sub-core (**stub**, chỉ ghi log `TODO IPC`).
++* Tín hiệu bật camera thật (số lùi, VHAL `GEAR_SELECTION`): hiện chỉ trigger được qua adb.
++* Lấy webcam host qua Camera2 cho wallpaper (tùy chọn): chưa làm, wallpaper đang vẽ test pattern.
++* Sepolicy cho `persist.debug.camera.emulator_test`, nếu bản build của bạn chặn app đọc property này.
++
++**Giới hạn của phương án B:**
++* Window hệ thống nằm **dưới** window camera và ngoài TDA (`TYPE_APPLICATION_OVERLAY`, toast)
++  vẫn lộ qua lỗ (nút 1 minh họa điều này). IME (layer 13) nằm **trên** window camera.
++* Khi SystemUI restart, app lộ qua lỗ cho đến khi app camera reconnect (mục 6.7).
++* Vuốt từ mép màn hình sẽ hiện thanh tạm thời. Muốn khóa hẳn thì phải sửa chính sách trong
++  CarSystemUI.
++
++**Những thứ emulator không test được:**
++* Blend plane thật: ARGB/XRGB, premultiplied alpha, zpos.
++* HWC/DPU của vendor (composition thật của lỗ alpha 0 với plane camera).
++* Độ trễ camera thật và đồng bộ giữa hai OS.
++* Early RVC lúc boot (camera phải hiện trước khi Android lên).
++* Đổi zpos khi vào chế độ SAFETY.
+--- /dev/null
++++ b/vendor/kane/cameratest/TestPatternWallpaper/Android.bp
+@@ -0,0 +1,16 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++// EMULATOR TEST ONLY. Live wallpaper drawing a moving test pattern; stands in for the
++// sub-core camera plane, which does not exist on the emulator.
++android_app {
++    name: "KaneTestPatternWallpaper",
++    srcs: ["src/**/*.java"],
++    resource_dirs: ["res"],
++    platform_apis: true,
++    certificate: "platform",
++    privileged: true,
++    system_ext_specific: true,
++    required: ["privapp-permissions-kane-cameratest.xml"],
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/TestPatternWallpaper/AndroidManifest.xml
+@@ -0,0 +1,32 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.kane.testpattern">
++
++    <!-- SetWallpaperReceiver selects this live wallpaper without a picker (car has none). -->
++    <uses-permission android:name="android.permission.SET_WALLPAPER_COMPONENT" />
++
++    <application android:label="Test Pattern Wallpaper">
++        <service
++            android:name=".TestPatternWallpaperService"
++            android:exported="true"
++            android:permission="android.permission.BIND_WALLPAPER">
++            <intent-filter>
++                <action android:name="android.service.wallpaper.WallpaperService" />
++            </intent-filter>
++            <meta-data
++                android:name="android.service.wallpaper"
++                android:resource="@xml/wallpaper" />
++        </service>
++
++        <!-- Triggered from adb with action com.kane.testpattern.action.SET for the current
++             user; see the README for the exact command. -->
++        <receiver
++            android:name=".SetWallpaperReceiver"
++            android:exported="true"
++            android:permission="android.permission.DUMP">
++            <intent-filter>
++                <action android:name="com.kane.testpattern.action.SET" />
++            </intent-filter>
++        </receiver>
++    </application>
++</manifest>
+--- /dev/null
++++ b/vendor/kane/cameratest/TestPatternWallpaper/res/values/strings.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="wallpaper_description">Fake camera plane: color grid + running timestamp</string>
++</resources>
+--- /dev/null
++++ b/vendor/kane/cameratest/TestPatternWallpaper/res/xml/wallpaper.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<wallpaper xmlns:android="http://schemas.android.com/apk/res/android"
++    android:description="@string/wallpaper_description" />
+--- /dev/null
++++ b/vendor/kane/cameratest/TestPatternWallpaper/src/com/kane/testpattern/SetWallpaperReceiver.java
+@@ -0,0 +1,26 @@
++package com.kane.testpattern;
++
++import android.app.WallpaperManager;
++import android.content.BroadcastReceiver;
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.util.Log;
++
++/** Makes {@link TestPatternWallpaperService} the wallpaper of the user receiving the broadcast. */
++public class SetWallpaperReceiver extends BroadcastReceiver {
++    private static final String TAG = "TestPattern";
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        final WallpaperManager wm = WallpaperManager.getInstance(context);
++        if (wm == null || !wm.isWallpaperSupported()) {
++            Log.e(TAG, "Wallpaper service disabled: is KaneCameraTestFrameworkOverlay installed?");
++            return;
++        }
++        final ComponentName cn = new ComponentName(context, TestPatternWallpaperService.class);
++        final boolean ok = wm.setWallpaperComponent(cn);
++        Log.i(TAG, "setWallpaperComponent(" + cn.flattenToShortString() + ") = " + ok
++                + " user=" + context.getUserId());
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/TestPatternWallpaper/src/com/kane/testpattern/TestPatternWallpaperService.java
+@@ -0,0 +1,140 @@
++package com.kane.testpattern;
++
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.graphics.Typeface;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.SystemClock;
++import android.service.wallpaper.WallpaperService;
++import android.view.SurfaceHolder;
++
++import java.text.SimpleDateFormat;
++import java.util.Date;
++import java.util.Locale;
++
++/**
++ * Fake camera plane for the emulator: an animated color grid, a sweeping bar and a running
++ * timestamp/frame counter, so it is obvious that the image under the hole is live.
++ */
++public class TestPatternWallpaperService extends WallpaperService {
++
++    @Override
++    public Engine onCreateEngine() {
++        return new PatternEngine();
++    }
++
++    private final class PatternEngine extends Engine {
++        private static final long FRAME_MS = 33;
++        private static final int COLS = 8;
++        private static final int ROWS = 6;
++
++        private final Handler mHandler = new Handler(Looper.getMainLooper());
++        private final Paint mFill = new Paint();
++        private final Paint mLine = new Paint();
++        private final Paint mText = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final Paint mTextBg = new Paint();
++        private final SimpleDateFormat mTime = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
++        private final float[] mHsv = {0f, 0.8f, 0.9f};
++        private final long mStart = SystemClock.uptimeMillis();
++        private long mFrame;
++        private boolean mVisible;
++
++        private final Runnable mDrawRunnable = this::drawFrame;
++
++        PatternEngine() {
++            mLine.setColor(Color.WHITE);
++            mLine.setStrokeWidth(2f);
++            mText.setColor(Color.WHITE);
++            mText.setTypeface(Typeface.MONOSPACE);
++            mText.setTextAlign(Paint.Align.CENTER);
++            mTextBg.setColor(0xB0000000);
++        }
++
++        @Override
++        public void onVisibilityChanged(boolean visible) {
++            mVisible = visible;
++            mHandler.removeCallbacks(mDrawRunnable);
++            if (visible) {
++                drawFrame();
++            }
++        }
++
++        @Override
++        public void onSurfaceChanged(SurfaceHolder holder, int format, int width, int height) {
++            drawFrame();
++        }
++
++        @Override
++        public void onSurfaceDestroyed(SurfaceHolder holder) {
++            mVisible = false;
++            mHandler.removeCallbacks(mDrawRunnable);
++        }
++
++        @Override
++        public void onDestroy() {
++            mHandler.removeCallbacks(mDrawRunnable);
++        }
++
++        private void drawFrame() {
++            final SurfaceHolder holder = getSurfaceHolder();
++            Canvas c = null;
++            try {
++                c = holder.lockHardwareCanvas();
++                if (c != null) {
++                    draw(c);
++                }
++            } finally {
++                if (c != null) {
++                    holder.unlockCanvasAndPost(c);
++                }
++            }
++            mHandler.removeCallbacks(mDrawRunnable);
++            if (mVisible) {
++                mHandler.postDelayed(mDrawRunnable, FRAME_MS);
++            }
++        }
++
++        private void draw(Canvas c) {
++            final int w = c.getWidth();
++            final int h = c.getHeight();
++            final long t = SystemClock.uptimeMillis() - mStart;
++            mFrame++;
++
++            // Color grid, hues rotating over time.
++            final float cw = w / (float) COLS;
++            final float ch = h / (float) ROWS;
++            for (int row = 0; row < ROWS; row++) {
++                for (int col = 0; col < COLS; col++) {
++                    mHsv[0] = ((col * 45 + row * 20) + t / 20f) % 360f;
++                    mFill.setColor(Color.HSVToColor(mHsv));
++                    c.drawRect(col * cw, row * ch, (col + 1) * cw, (row + 1) * ch, mFill);
++                }
++            }
++            for (int col = 1; col < COLS; col++) {
++                c.drawLine(col * cw, 0, col * cw, h, mLine);
++            }
++            for (int row = 1; row < ROWS; row++) {
++                c.drawLine(0, row * ch, w, row * ch, mLine);
++            }
++
++            // Sweeping bar: motion is visible even in a screenshot pair.
++            final float barX = (t / 4f) % w;
++            mFill.setColor(0xCCFFFFFF);
++            c.drawRect(barX, 0, barX + w / 40f, h, mFill);
++
++            // Timestamp and frame counter.
++            mText.setTextSize(h / 12f);
++            final String l1 = "FAKE CAMERA PLANE";
++            final String l2 = mTime.format(new Date());
++            final String l3 = "frame " + mFrame + "  " + w + "x" + h;
++            final float lh = mText.getTextSize() * 1.2f;
++            final float top = h / 2f - lh * 1.5f;
++            c.drawRect(w * 0.2f, top - lh * 0.2f, w * 0.8f, top + lh * 3f, mTextBg);
++            c.drawText(l1, w / 2f, top + lh * 0.8f, mText);
++            c.drawText(l2, w / 2f, top + lh * 1.8f, mText);
++            c.drawText(l3, w / 2f, top + lh * 2.8f, mText);
++        }
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/TouchTestApp/Android.bp
+@@ -0,0 +1,12 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++// EMULATOR TEST ONLY. A grid of buttons that log every click: open it, turn the camera on, tap
++// the hole; no "TouchTest" log line may appear.
++android_app {
++    name: "KaneTouchTest",
++    srcs: ["src/**/*.java"],
++    sdk_version: "current",
++    system_ext_specific: true,
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/TouchTestApp/AndroidManifest.xml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.kane.touchtest">
++
++    <application android:label="Touch Test">
++        <activity
++            android:name=".TouchTestActivity"
++            android:exported="true"
++            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++            <meta-data android:name="distractionOptimized" android:value="true" />
++        </activity>
++    </application>
++</manifest>
+--- /dev/null
++++ b/vendor/kane/cameratest/TouchTestApp/src/com/kane/touchtest/TouchTestActivity.java
+@@ -0,0 +1,45 @@
++package com.kane.touchtest;
++
++import android.app.Activity;
++import android.os.Bundle;
++import android.util.Log;
++import android.view.Gravity;
++import android.widget.Button;
++import android.widget.GridLayout;
++
++/** Full-screen grid of buttons; every click is logged with tag "TouchTest". */
++public class TouchTestActivity extends Activity {
++    private static final String TAG = "TouchTest";
++    private static final int COLS = 4;
++    private static final int ROWS = 3;
++
++    private final int[] mClicks = new int[COLS * ROWS];
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        final GridLayout grid = new GridLayout(this);
++        grid.setColumnCount(COLS);
++        grid.setRowCount(ROWS);
++        grid.setBackgroundColor(0xFF263238);
++        for (int i = 0; i < COLS * ROWS; i++) {
++            final int index = i;
++            final Button b = new Button(this);
++            b.setText("Nút " + (i + 1));
++            b.setTextSize(24);
++            b.setOnClickListener(v -> {
++                mClicks[index]++;
++                b.setText("Nút " + (index + 1) + "\nclick " + mClicks[index]);
++                Log.i(TAG, "CLICK button " + (index + 1) + " count=" + mClicks[index]);
++            });
++            final GridLayout.LayoutParams lp = new GridLayout.LayoutParams(
++                    GridLayout.spec(i / COLS, 1f), GridLayout.spec(i % COLS, 1f));
++            lp.width = 0;
++            lp.height = 0;
++            lp.setGravity(Gravity.FILL);
++            lp.setMargins(8, 8, 8, 8);
++            grid.addView(b, lp);
++        }
++        setContentView(grid);
++    }
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/cameratest.mk
+@@ -0,0 +1,16 @@
++#
++# Camera hole-punch test kit (EMULATOR / BRING-UP ONLY).
++#
++# Include from vendor/kane/products/kane_car.mk:
++#   $(call inherit-product, vendor/kane/cameratest/cameratest.mk)
++#
++# Do not include in production images: KaneCameraTestFrameworkOverlay turns the wallpaper
++# service back on, and the apps expose adb-triggered test hooks.
++#
++
++PRODUCT_PACKAGES += \
++    KaneCameraTest \
++    KaneTestPatternWallpaper \
++    KaneTouchTest \
++    KaneCameraTestFrameworkOverlay \
++    privapp-permissions-kane-cameratest.xml
+--- /dev/null
++++ b/vendor/kane/cameratest/overlay/EmulatorWallpaperOverlay/Android.bp
+@@ -0,0 +1,16 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++// EMULATOR TEST ONLY. Car builds disable the wallpaper service
++// (car_product overlay: config_enableWallpaperService=false). The emulator test uses a live
++// wallpaper as the fake camera plane, so turn it back on. Never ship this in production.
++runtime_resource_overlay {
++    name: "KaneCameraTestFrameworkOverlay",
++    resource_dirs: ["res"],
++    product_specific: true,
++    sdk_version: "current",
++    // config_enableWallpaperService is not <overlayable>: only a platform-signed overlay may
++    // change it.
++    certificate: "platform",
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/overlay/EmulatorWallpaperOverlay/AndroidManifest.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.kane.cameratest.overlay.framework">
++    <application android:hasCode="false" />
++    <overlay
++        android:targetPackage="android"
++        android:isStatic="true"
++        android:priority="900" />
++</manifest>
+--- /dev/null
++++ b/vendor/kane/cameratest/overlay/EmulatorWallpaperOverlay/res/values/config.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <!-- Emulator test: the live wallpaper stands in for the sub-core camera plane. -->
++    <bool name="config_enableWallpaperService">true</bool>
++</resources>
+--- /dev/null
++++ b/vendor/kane/cameratest/privapp/Android.bp
+@@ -0,0 +1,10 @@
++package {
++    default_applicable_licenses: ["Android-Apache-2.0"],
++}
++
++prebuilt_etc {
++    name: "privapp-permissions-kane-cameratest.xml",
++    src: "privapp-permissions-kane-cameratest.xml",
++    sub_dir: "permissions",
++    system_ext_specific: true,
++}
+--- /dev/null
++++ b/vendor/kane/cameratest/privapp/privapp-permissions-kane-cameratest.xml
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Privileged permissions of the camera test apps (system_ext priv-app). The apps are platform
++     signed, so signature-only permissions (INTERNAL_SYSTEM_WINDOW, MANAGE_ACTIVITY_TASKS,
++     CONTROL_CAMERA_APP_AREA, ...) need no entry here. -->
++<permissions>
++    <privapp-permissions package="com.kane.cameratest">
++        <permission name="android.permission.DUMP" />
++        <permission name="android.permission.INTERACT_ACROSS_USERS" />
++        <permission name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
++    </privapp-permissions>
++    <privapp-permissions package="com.kane.testpattern">
++        <permission name="android.permission.SET_WALLPAPER_COMPONENT" />
++    </privapp-permissions>
++</permissions>

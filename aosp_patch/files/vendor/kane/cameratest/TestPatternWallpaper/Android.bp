@@ -1,0 +1,16 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// EMULATOR TEST ONLY. Live wallpaper drawing a moving test pattern; stands in for the
+// sub-core camera plane, which does not exist on the emulator.
+android_app {
+    name: "KaneTestPatternWallpaper",
+    srcs: ["src/**/*.java"],
+    resource_dirs: ["res"],
+    platform_apis: true,
+    certificate: "platform",
+    privileged: true,
+    system_ext_specific: true,
+    required: ["privapp-permissions-kane-cameratest.xml"],
+}

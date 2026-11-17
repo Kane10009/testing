@@ -1,0 +1,17 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// Test camera app for the hole-punch camera window (emulator / bring-up).
+// Uses hidden APIs (window types, task listing), so it is platform signed.
+android_app {
+    name: "KaneCameraTest",
+    srcs: ["src/**/*.java"],
+    resource_dirs: ["res"],
+    platform_apis: true,
+    certificate: "platform",
+    privileged: true,
+    system_ext_specific: true,
+    static_libs: ["car-camera-app-area-aidl"],
+    required: ["privapp-permissions-kane-cameratest.xml"],
+}

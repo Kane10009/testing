@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Privileged permissions of the camera test apps (system_ext priv-app). The apps are platform
+     signed, so signature-only permissions (INTERNAL_SYSTEM_WINDOW, MANAGE_ACTIVITY_TASKS,
+     CONTROL_CAMERA_APP_AREA, ...) need no entry here. -->
+<permissions>
+    <privapp-permissions package="com.kane.cameratest">
+        <permission name="android.permission.DUMP" />
+        <permission name="android.permission.INTERACT_ACROSS_USERS" />
+        <permission name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
+    </privapp-permissions>
+    <privapp-permissions package="com.kane.testpattern">
+        <permission name="android.permission.SET_WALLPAPER_COMPONENT" />
+    </privapp-permissions>
+</permissions>

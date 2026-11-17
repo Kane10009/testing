@@ -1,0 +1,16 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// EMULATOR TEST ONLY. Car builds disable the wallpaper service
+// (car_product overlay: config_enableWallpaperService=false). The emulator test uses a live
+// wallpaper as the fake camera plane, so turn it back on. Never ship this in production.
+runtime_resource_overlay {
+    name: "KaneCameraTestFrameworkOverlay",
+    resource_dirs: ["res"],
+    product_specific: true,
+    sdk_version: "current",
+    // config_enableWallpaperService is not <overlayable>: only a platform-signed overlay may
+    // change it.
+    certificate: "platform",
+}

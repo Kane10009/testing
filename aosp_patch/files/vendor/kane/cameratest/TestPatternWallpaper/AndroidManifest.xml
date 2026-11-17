@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.kane.testpattern">
+
+    <!-- SetWallpaperReceiver selects this live wallpaper without a picker (car has none). -->
+    <uses-permission android:name="android.permission.SET_WALLPAPER_COMPONENT" />
+
+    <application android:label="Test Pattern Wallpaper">
+        <service
+            android:name=".TestPatternWallpaperService"
+            android:exported="true"
+            android:permission="android.permission.BIND_WALLPAPER">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/wallpaper" />
+        </service>
+
+        <!-- Triggered from adb with action com.kane.testpattern.action.SET for the current
+             user; see the README for the exact command. -->
+        <receiver
+            android:name=".SetWallpaperReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.kane.testpattern.action.SET" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

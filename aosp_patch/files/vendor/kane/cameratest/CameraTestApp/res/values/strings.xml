@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Camera Test</string>
+
+    <string name="btn_popup_below">Popup DƯỚI\n(layer 11)</string>
+    <string name="btn_popup_above">Popup TRÊN\n(layer 27)</string>
+    <string name="btn_open_activity">Mở Activity\ntest</string>
+    <string name="btn_dump_stack">Activity\ntrong stack</string>
+
+    <string name="hole_touch_counter">Vùng camera đã nuốt %1$d lần chạm</string>
+
+    <string name="popup_below_text">POPUP DƯỚI\nTYPE_APPLICATION_OVERLAY (layer 11)\nnằm DƯỚI window camera, NGOÀI TDA.\nThấy popup này qua lỗ = window ngoài TDA bị lộ.</string>
+    <string name="popup_above_text">POPUP TRÊN\nTYPE_SYSTEM_ERROR (layer 27)\nnằm TRÊN window camera.\nChạm để đóng.</string>
+
+    <string name="transparency_title">TransparencyTestActivity</string>
+    <string name="transparency_body">Activity này nằm trong DefaultTaskDisplayArea.\n\nKhi camera BẬT: bạn KHÔNG được thấy màn hình này (TDA đang bị ẩn).\nKhi camera TẮT: màn hình này phải hiện ra.</string>
+    <string name="transparency_close">Đóng</string>
+</resources>
